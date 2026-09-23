@@ -12,6 +12,22 @@ cargo run --release
 
 A window around 100 × 34 characters or larger gives a clear view. The game adapts to terminal resizing. Use `cargo run --release -- --cube` to view the rotating cube renderer check.
 
+## WebAssembly / browser
+
+Install the Rust WASM target once, build the browser version, then serve the
+`web` directory over HTTP:
+
+```sh
+rustup target add wasm32-unknown-unknown
+./build-web.sh
+python3 -m http.server 8000 --directory web
+```
+
+Open <http://localhost:8000>. The browser build uses the same Rust physics,
+track, camera, and ASCII renderer as the terminal version. `web/index.html`
+provides the canvas display, keyboard input, and touch controls; the build
+places the standalone module at `web/ascii_racer.wasm`.
+
 ## Controls
 
 | Key | Action |

@@ -3,6 +3,16 @@ name = "ascii-racer"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 glam = "0.30"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 crossterm = "0.29"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

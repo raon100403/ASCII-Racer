@@ -199,6 +199,19 @@ impl Renderer {
         }
         out
     }
+
+    /// Packs each cell as `0xBBGGRRCC` for the dependency-free WebAssembly host.
+    /// `CC` is the ASCII character and the remaining bytes are its RGB color.
+    pub fn write_packed_cells(&self, output: &mut Vec<u32>) {
+        output.clear();
+        output.reserve(self.cells.len());
+        output.extend(self.cells.iter().map(|cell| {
+            cell.ch as u32
+                | (cell.color.0 as u32) << 8
+                | (cell.color.1 as u32) << 16
+                | (cell.color.2 as u32) << 24
+        }));
+    }
 }
 
 fn clip_near(input: &[Vertex; 3]) -> Vec<Vertex> {

@@ -1,26 +1,35 @@
-mod car;
-mod mesh;
-mod renderer;
-mod track;
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
-use car::Car;
+#[cfg(not(target_arch = "wasm32"))]
+use ascii_racer::{
+    car::Car,
+    mesh::Mesh,
+    renderer::{Camera, Renderer},
+    track::{ROAD_HALF_WIDTH, Track},
+};
+#[cfg(not(target_arch = "wasm32"))]
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
     execute, terminal,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use glam::{Mat4, Vec3};
-use mesh::Mesh;
-use renderer::{Camera, Renderer};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{self, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
-use track::{ROAD_HALF_WIDTH, Track};
 
+#[cfg(not(target_arch = "wasm32"))]
 const FRAME_TIME: Duration = Duration::from_millis(33);
+#[cfg(not(target_arch = "wasm32"))]
 const INPUT_HOLD: Duration = Duration::from_millis(250);
+#[cfg(not(target_arch = "wasm32"))]
 const TOTAL_LAPS: u32 = 3;
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Terminal;
+#[cfg(not(target_arch = "wasm32"))]
 impl Terminal {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
@@ -31,6 +40,7 @@ impl Terminal {
         Ok(Self)
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
@@ -38,6 +48,7 @@ impl Drop for Terminal {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct Inputs {
     forward: Option<Instant>,
@@ -48,6 +59,7 @@ struct Inputs {
     reset: bool,
     quit: bool,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Inputs {
     fn handle(&mut self, event: Event) {
         if let Event::Key(key) = event {
@@ -89,6 +101,7 @@ impl Inputs {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> io::Result<()> {
     // The guard is dropped during normal return and panic unwinding.
     let _terminal = Terminal::enter()?;
@@ -175,6 +188,10 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn draw_hud(renderer: &mut Renderer, car: &Car, track: &Track, elapsed: Duration, offroad: bool) {
     let total_secs = elapsed.as_secs();
     let status = if track.laps >= TOTAL_LAPS {
