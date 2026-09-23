@@ -43,5 +43,3 @@ The renderer's framebuffer has one cell per terminal character. Each cell stores
 ## Current scope and future extensions
 
 The track, car, and walls use code-generated geometry. Physics and collisions are intentionally simple. Possible later additions include additional tracks, AI opponents, split times, and configurable cell aspect ratio. No textures, GPU rendering, or game engine are used.
-# cargameascii
-# ASCII-Racer
