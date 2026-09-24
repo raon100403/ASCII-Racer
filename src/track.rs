@@ -1,4 +1,4 @@
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, SurfaceKind};
 use glam::{Mat4, Vec2, Vec3};
 
 pub const ROAD_HALF_WIDTH: f32 = 6.2;
@@ -128,7 +128,7 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
     let b = Vec3::new(-210.0, -0.08, 210.0);
     let c = Vec3::new(210.0, -0.08, 210.0);
     let d = Vec3::new(210.0, -0.08, -210.0);
-    mesh.quad(a, b, c, d, grass, 0.34);
+    mesh.quad_kind(a, b, c, d, grass, 0.34, SurfaceKind::Ground);
     for i in 0..points.len() {
         let a = points[i];
         let b = points[(i + 1) % points.len()];
@@ -144,6 +144,7 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             0.0,
             (125, 118, 89),
             0.52,
+            SurfaceKind::Ground,
         );
         strip(
             &mut mesh,
@@ -155,6 +156,7 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             0.025,
             (87, 91, 96),
             0.62,
+            SurfaceKind::Road,
         );
         strip(
             &mut mesh,
@@ -166,6 +168,7 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             0.04,
             (245, 225, 145),
             1.0,
+            SurfaceKind::RoadMarking,
         );
         strip(
             &mut mesh,
@@ -177,6 +180,7 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             0.04,
             (245, 225, 145),
             1.0,
+            SurfaceKind::RoadMarking,
         );
         let mut distance = 4.0;
         let length = a.distance(b);
@@ -192,13 +196,15 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
                 0.048,
                 (225, 216, 176),
                 0.95,
+                SurfaceKind::RoadMarking,
             );
             distance += 8.0;
         }
         if RAIL_SEGMENTS.contains(&i) {
             for side in [-1.0, 1.0] {
                 let middle = (a + b) * 0.5 + right * side * (ROAD_HALF_WIDTH + 1.1);
-                let box_mesh = Mesh::box_mesh(Vec3::new(0.28, 0.65, length), (202, 208, 218));
+                let box_mesh = Mesh::box_mesh(Vec3::new(0.28, 0.65, length), (202, 208, 218))
+                    .with_surface(SurfaceKind::Guardrail);
                 let yaw = dir.x.atan2(dir.y);
                 mesh.append_transformed(
                     &box_mesh,
@@ -222,7 +228,55 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
                         angle.sin() * ROAD_HALF_WIDTH,
                     )
             };
-            mesh.add([center, rim(angle_b), rim(angle_a)], (87, 91, 96), 0.62);
+            mesh.add_kind(
+                [center, rim(angle_b), rim(angle_a)],
+                (87, 91, 96),
+                0.62,
+                SurfaceKind::Road,
+            );
+        }
+    }
+    // Bridge the outer edge of each bend with the same circular profile as the road join.
+    for i in 0..points.len() {
+        let point = points[i];
+        let incoming = (point - points[(i + points.len() - 1) % points.len()]).normalize();
+        let outgoing = (points[(i + 1) % points.len()] - point).normalize();
+        let turn = incoming.perp_dot(outgoing);
+        if turn.abs() < 0.001 {
+            continue;
+        }
+        let side = turn.signum();
+        let start = Vec2::new(incoming.y, -incoming.x) * side;
+        let end = Vec2::new(outgoing.y, -outgoing.x) * side;
+        let angle = start.perp_dot(end).atan2(start.dot(end));
+        let steps = ((angle.abs() * 8.0).ceil() as usize).max(1);
+        for step in 0..steps {
+            let dir = |t: f32| {
+                let a = angle * t;
+                Vec2::new(
+                    start.x * a.cos() - start.y * a.sin(),
+                    start.x * a.sin() + start.y * a.cos(),
+                )
+            };
+            let at = |direction: Vec2, radius: f32| {
+                Vec3::new(
+                    point.x + direction.x * radius,
+                    0.045,
+                    point.y + direction.y * radius,
+                )
+            };
+            let u = dir(step as f32 / steps as f32);
+            let v = dir((step + 1) as f32 / steps as f32);
+            let inner_a = at(u, ROAD_HALF_WIDTH - 0.18);
+            let outer_a = at(u, ROAD_HALF_WIDTH);
+            let inner_b = at(v, ROAD_HALF_WIDTH - 0.18);
+            let outer_b = at(v, ROAD_HALF_WIDTH);
+            let (a, b, c, d) = if turn > 0.0 {
+                (inner_a, inner_b, outer_b, outer_a)
+            } else {
+                (outer_a, outer_b, inner_b, inner_a)
+            };
+            mesh.quad_kind(a, b, c, d, (245, 225, 145), 1.0, SurfaceKind::RoadMarking);
         }
     }
     for &index in CHECKPOINTS {
@@ -241,10 +295,12 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             0.065,
             (95, 230, 230),
             1.0,
+            SurfaceKind::Checkpoint,
         );
         for side in [-1.0, 1.0] {
             let pos = p + right * side * (ROAD_HALF_WIDTH + 0.55);
-            let pillar = Mesh::box_mesh(Vec3::new(0.48, 2.2, 0.48), (80, 225, 235));
+            let pillar = Mesh::box_mesh(Vec3::new(0.48, 2.2, 0.48), (80, 225, 235))
+                .with_surface(SurfaceKind::Checkpoint);
             mesh.append_transformed(
                 &pillar,
                 Mat4::from_translation(Vec3::new(pos.x, 1.1, pos.y)),
@@ -264,17 +320,19 @@ fn strip(
     y: f32,
     color: (u8, u8, u8),
     shade: f32,
+    surface: SurfaceKind,
 ) {
     let p = |point: Vec2, offset: f32| {
         Vec3::new(point.x + right.x * offset, y, point.y + right.y * offset)
     };
-    mesh.quad(
+    mesh.quad_kind(
         p(a, left),
         p(b, left),
         p(b, right_edge),
         p(a, right_edge),
         color,
         shade,
+        surface,
     );
 }
 
@@ -292,5 +350,48 @@ mod tests {
             track.update_checkpoint(Vec3::new(p.x, 0.0, p.y));
         }
         assert_eq!(track.laps, 1);
+    }
+
+    #[test]
+    fn outer_corner_markings_face_up_and_meet_straight_edges() {
+        let track = Track::new();
+        let joints: Vec<_> = track
+            .mesh
+            .triangles
+            .iter()
+            .filter(|t| {
+                t.surface == SurfaceKind::RoadMarking
+                    && t.vertices.iter().all(|v| (v.y - 0.045).abs() < 0.0001)
+            })
+            .collect();
+        assert!(!joints.is_empty());
+        for t in &joints {
+            let normal = (t.vertices[1] - t.vertices[0])
+                .cross(t.vertices[2] - t.vertices[0])
+                .y;
+            assert!(
+                normal > 0.0,
+                "inverted corner marking: {normal}, {:?}",
+                t.vertices
+            );
+        }
+        for i in 0..track.points.len() {
+            let point = track.points[i];
+            let prev = (point - track.points[(i + track.points.len() - 1) % track.points.len()])
+                .normalize();
+            let next = (track.points[(i + 1) % track.points.len()] - point).normalize();
+            let side = prev.perp_dot(next).signum();
+            for direction in [prev, next] {
+                let right = Vec2::new(direction.y, -direction.x) * side;
+                let tip = point + right * ROAD_HALF_WIDTH;
+                assert!(
+                    joints.iter().any(|t| t
+                        .vertices
+                        .iter()
+                        .any(|v| { (Vec2::new(v.x, v.z) - tip).length() < 0.001 })),
+                    "missing marking join at corner {i}"
+                );
+            }
+        }
     }
 }

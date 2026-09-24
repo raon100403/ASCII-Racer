@@ -125,8 +125,9 @@ pub extern "C" fn game_init(width: u32, height: u32) {
 pub extern "C" fn game_resize(width: u32, height: u32) {
     GAME.with_borrow_mut(|game| {
         if let Some(game) = game {
-            game.renderer = Renderer::new(width.max(1) as usize, height.max(1) as usize, true);
-            game.packed_cells = Vec::with_capacity(width as usize * height as usize);
+            game.renderer
+                .resize(width.max(1) as usize, height.max(1) as usize);
+            game.packed_cells.clear();
         }
     });
 }

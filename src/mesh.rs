@@ -1,10 +1,28 @@
 use glam::{Mat4, Vec3};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceKind {
+    Generic,
+    Ground,
+    Road,
+    RoadMarking,
+    Vehicle,
+    Guardrail,
+    Checkpoint,
+}
+
+impl SurfaceKind {
+    pub fn important(self) -> bool {
+        matches!(self, Self::RoadMarking | Self::Vehicle | Self::Checkpoint)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Triangle {
     pub vertices: [Vec3; 3],
     pub color: (u8, u8, u8),
     pub shade: f32,
+    pub surface: SurfaceKind,
 }
 
 pub struct Mesh {
@@ -19,16 +37,48 @@ impl Mesh {
     }
 
     pub fn add(&mut self, vertices: [Vec3; 3], color: (u8, u8, u8), shade: f32) {
+        self.add_kind(vertices, color, shade, SurfaceKind::Generic);
+    }
+
+    pub fn add_kind(
+        &mut self,
+        vertices: [Vec3; 3],
+        color: (u8, u8, u8),
+        shade: f32,
+        surface: SurfaceKind,
+    ) {
         self.triangles.push(Triangle {
             vertices,
             color,
             shade,
+            surface,
         });
     }
 
     pub fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: (u8, u8, u8), shade: f32) {
         self.add([a, b, c], color, shade);
         self.add([a, c, d], color, shade);
+    }
+
+    pub fn quad_kind(
+        &mut self,
+        a: Vec3,
+        b: Vec3,
+        c: Vec3,
+        d: Vec3,
+        color: (u8, u8, u8),
+        shade: f32,
+        surface: SurfaceKind,
+    ) {
+        self.add_kind([a, b, c], color, shade, surface);
+        self.add_kind([a, c, d], color, shade, surface);
+    }
+
+    pub fn with_surface(mut self, surface: SurfaceKind) -> Self {
+        for triangle in &mut self.triangles {
+            triangle.surface = surface;
+        }
+        self
     }
 
     pub fn box_mesh(size: Vec3, color: (u8, u8, u8)) -> Self {
@@ -60,10 +110,11 @@ impl Mesh {
 
     pub fn append_transformed(&mut self, other: &Mesh, transform: Mat4) {
         for tri in &other.triangles {
-            self.add(
+            self.add_kind(
                 tri.vertices.map(|v| transform.transform_point3(v)),
                 tri.color,
                 tri.shade,
+                tri.surface,
             );
         }
     }

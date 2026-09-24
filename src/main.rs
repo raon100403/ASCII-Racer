@@ -4,7 +4,7 @@
 use ascii_racer::{
     car::Car,
     mesh::Mesh,
-    renderer::{Camera, Renderer},
+    renderer::{AaMode, Camera, Renderer},
     track::{ROAD_HALF_WIDTH, Track},
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,15 +102,66 @@ impl Inputs {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn rendering_options() -> io::Result<(bool, f32, AaMode)> {
+    let mut cube = false;
+    let mut aspect = 0.5;
+    let mut aa = AaMode::X2;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--cube" => cube = true,
+            "--cell-aspect" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--cell-aspect needs a positive number",
+                    )
+                })?;
+                aspect = value.parse::<f32>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid --cell-aspect")
+                })?;
+                if !aspect.is_finite() || aspect <= 0.0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--cell-aspect must be finite and positive",
+                    ));
+                }
+            }
+            "--aa" => {
+                aa = match args.next().as_deref() {
+                    Some("off") => AaMode::Off,
+                    Some("2x2") => AaMode::X2,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--aa must be off or 2x2",
+                        ));
+                    }
+                };
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown option: {arg}"),
+                ));
+            }
+        }
+    }
+    Ok((cube, aspect, aa))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> io::Result<()> {
+    let (cube_demo, cell_aspect, aa) = rendering_options()?;
     // The guard is dropped during normal return and panic unwinding.
     let _terminal = Terminal::enter()?;
-    let cube_demo = std::env::args().any(|arg| arg == "--cube");
     let (w, h) = terminal::size()?;
-    let mut renderer = Renderer::new(
+    let mut renderer = Renderer::with_options(
         w.saturating_sub(1).max(1) as usize,
         h.saturating_sub(1).max(1) as usize,
         true,
+        cell_aspect,
+        aa,
     );
     let mut inputs = Inputs::default();
     let mut car = Car::new();
@@ -136,7 +187,7 @@ fn main() -> io::Result<()> {
         let new_w = w.saturating_sub(1).max(1) as usize;
         let new_h = h.saturating_sub(1).max(1) as usize;
         if new_w != renderer.width || new_h != renderer.height {
-            renderer = Renderer::new(new_w, new_h, true);
+            renderer.resize(new_w, new_h);
         }
         renderer.clear();
         if cube_demo {

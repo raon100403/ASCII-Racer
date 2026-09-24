@@ -1,4 +1,4 @@
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, SurfaceKind};
 use glam::{Mat4, Vec3};
 
 const MAX_SPEED: f32 = 34.0;
@@ -113,6 +113,7 @@ impl Car {
                 (255, 236, 145),
             );
         }
+        local = local.with_surface(SurfaceKind::Vehicle);
         let transform = Mat4::from_translation(self.position) * Mat4::from_rotation_y(self.yaw);
         let mut world = Mesh::new();
         world.append_transformed(&local, transform);
