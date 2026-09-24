@@ -4,7 +4,7 @@
 use ascii_racer::{
     car::Car,
     mesh::Mesh,
-    renderer::{AaMode, Camera, Renderer},
+    renderer::{AaMode, Camera, DebugView, Renderer},
     track::{ROAD_HALF_WIDTH, Track},
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,13 +102,19 @@ impl Inputs {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn rendering_options() -> io::Result<(bool, f32, AaMode)> {
+fn rendering_options() -> io::Result<(bool, f32, AaMode, DebugView)> {
     let mut cube = false;
     let mut aspect = 0.5;
     let mut aa = AaMode::X2;
+    let mut debug = DebugView::Normal;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--debug-coverage" => debug = DebugView::Coverage,
+            "--debug-effective-coverage" => debug = DebugView::EffectiveCoverage,
+            "--debug-road-marking-width" => debug = DebugView::Width,
+            "--debug-road-marking-fade" => debug = DebugView::Fade,
+            "--debug-road-markings" => debug = DebugView::RoadMarkings,
             "--cube" => cube = true,
             "--cell-aspect" => {
                 let value = args.next().ok_or_else(|| {
@@ -147,12 +153,12 @@ fn rendering_options() -> io::Result<(bool, f32, AaMode)> {
             }
         }
     }
-    Ok((cube, aspect, aa))
+    Ok((cube, aspect, aa, debug))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> io::Result<()> {
-    let (cube_demo, cell_aspect, aa) = rendering_options()?;
+    let (cube_demo, cell_aspect, aa, debug) = rendering_options()?;
     // The guard is dropped during normal return and panic unwinding.
     let _terminal = Terminal::enter()?;
     let (w, h) = terminal::size()?;
@@ -163,6 +169,7 @@ fn main() -> io::Result<()> {
         cell_aspect,
         aa,
     );
+    renderer.set_debug_view(debug);
     let mut inputs = Inputs::default();
     let mut car = Car::new();
     let mut track = Track::new();
@@ -227,6 +234,7 @@ fn main() -> io::Result<()> {
             camera.position = camera.position.lerp(desired, smoothing);
             camera.target = camera.target.lerp(target, smoothing);
             renderer.draw_mesh(&track.mesh, camera);
+            renderer.draw_ribbons(&track.ribbons, camera);
             renderer.draw_mesh(&car.mesh(), camera);
             draw_hud(&mut renderer, &car, &track, start.elapsed(), offroad);
         }

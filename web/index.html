@@ -3,10 +3,24 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#07110b">
+  <meta name="theme-color" content="#000000">
   <title>ASCII Racer · WASM</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    @import url('https://fonts.googleapis.com/css2?family=VT323&display=swap');
+    @import url('https://cdn.jsdelivr.net/npm/galmuri@latest/dist/galmuri.css');
+
+    :root {
+      color-scheme: dark;
+      font-family: 'VT323', 'Galmuri9', 'Courier New', monospace;
+      --phosphor: #16f7ff;
+      --phosphor-dim: #42bfc9;
+      --phosphor-faint: #0b4c58;
+      --neon-purple: #9d4eff;
+      --neon-yellow: #ffe66d;
+      --neon-green: #42ff76;
+      --neon-orange: #ff8a3d;
+      --terminal-black: #000;
+    }
     * {
       box-sizing: border-box;
       -webkit-user-select: none;
@@ -15,24 +29,24 @@
     html, body { min-height: 100%; margin: 0; }
     body {
       display: grid; place-items: center; overflow-x: hidden;
-      background: radial-gradient(circle at 50% -20%, #243a2c 0, #0b1710 38%, #050805 80%);
-      color: #eef7eb;
+      background: var(--terminal-black);
+      color: var(--phosphor);
     }
     main { width: min(1180px, 100%); padding: clamp(14px, 3vw, 30px); }
-    header { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 12px; }
-    h1 { margin: 0; font-size: clamp(1.25rem, 3vw, 2rem); letter-spacing: .06em; }
-    .tag { color: #91d6a0; font: 700 .72rem/1 ui-monospace, monospace; letter-spacing: .14em; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 12px; padding-bottom: 8px; }
+    h1 { margin: 0; font-size: clamp(1.5rem, 3vw, 2.4rem); font-weight: 400; letter-spacing: .08em; color: var(--neon-purple); text-shadow: 0 0 8px #b77cff88; }
+    .tag { color: var(--neon-yellow); font: 400 1rem/1 'VT323', 'Galmuri9', 'Courier New', monospace; letter-spacing: .14em; text-shadow: 0 0 7px #ffe66d66; }
     .game-shell {
-      position: relative; overflow: hidden; border: 1px solid #35513b; border-radius: 14px;
-      background: #000; box-shadow: 0 24px 80px #000b, inset 0 0 0 1px #ffffff0a;
+      position: relative; overflow: hidden; border: 1px solid var(--phosphor-dim);
+      background: var(--terminal-black); box-shadow: 0 0 18px #42ff7622, inset 0 0 0 1px var(--phosphor-faint);
     }
     canvas {
       display: block; width: 100%; height: min(70vh, 680px); outline: none;
-      filter: contrast(.94) saturate(1.08);
     }
     #status {
       position: absolute; inset: 0; display: grid; place-items: center; padding: 24px;
-      background: #050805e8; color: #b9d5bd; text-align: center; font: 700 .9rem ui-monospace, monospace;
+      background: #000e; color: var(--phosphor); text-align: center; font: 400 1.25rem/1.2 'VT323', 'Galmuri9', 'Courier New', monospace;
+      text-shadow: 0 0 8px #16f7ff88;
     }
     #status[hidden] { display: none; }
     .controls { display: flex; justify-content: space-between; gap: 18px; margin-top: 14px; user-select: none; }
@@ -40,23 +54,38 @@
     .pad { grid-template-columns: repeat(3, 54px); grid-template-areas: ". up ." "left down right"; }
     .actions { grid-template-columns: repeat(2, minmax(72px, 108px)); align-content: end; }
     button {
-      min-height: 50px; border: 1px solid #45634c; border-radius: 11px; background: #142219;
-      color: #eaf6e8; font: 800 .78rem ui-monospace, monospace; touch-action: none; cursor: pointer;
-      box-shadow: inset 0 1px #ffffff12, 0 4px 12px #0005;
+      min-height: 50px; border: 1px solid var(--phosphor-dim); border-radius: 0; background: #031408;
+      color: var(--phosphor); font: 400 1.1rem/1 'VT323', 'Galmuri9', 'Courier New', monospace; touch-action: none; cursor: pointer;
+      box-shadow: inset 0 0 0 1px #16f7ff22, 0 0 10px #16f7ff22;
     }
-    button:active, button.active { background: #31553a; border-color: #73bd82; transform: translateY(1px); }
+    button:active, button.active { background: var(--phosphor-faint); border-color: var(--phosphor); color: #d7ffff; transform: translateY(1px); }
+    #reset { border-color: var(--neon-yellow); color: var(--neon-yellow); }
+    [data-key="drift"] { border-color: var(--neon-purple); color: var(--neon-purple); }
     [data-key="up"] { grid-area: up; } [data-key="left"] { grid-area: left; }
     [data-key="down"] { grid-area: down; } [data-key="right"] { grid-area: right; }
-    .hint { margin: 12px 2px 0; color: #829388; font-size: .78rem; text-align: center; }
+    .hint { margin: 12px 2px 0; color: var(--phosphor-dim); font-size: 1rem; line-height: 1.2; text-align: center; }
+    .latin { font-family: 'VT323', 'Courier New', monospace; font-size: 1.4em; line-height: 0.8; }
+    .hint-item { white-space: nowrap; }
+    .hint-item .latin { text-shadow: 0 0 7px currentColor; }
+    .hint-accelerate { color: var(--neon-green); }
+    .hint-brake { color: var(--neon-orange); }
+    .hint-steer { color: var(--phosphor); }
+    .hint-drift { color: var(--neon-purple); }
+    .hint-reset { color: var(--neon-yellow); }
+    .game-shell::after {
+      content: ''; position: absolute; inset: 0; pointer-events: none;
+      background: repeating-linear-gradient(to bottom, transparent 0, transparent 2px, #42ff7608 3px, transparent 4px);
+      mix-blend-mode: screen;
+    }
     @media (pointer: fine) and (min-width: 760px) { .controls { display: none; } }
   </style>
 </head>
 <body>
   <main>
-    <header><div><div class="tag">RUST · WEBASSEMBLY</div><h1>ASCII RACER</h1></div><div class="tag">3 LAPS</div></header>
+    <header><h1>ASCII RACER</h1><div class="tag">3 LAPS</div></header>
     <section class="game-shell">
       <canvas id="game" tabindex="0" aria-label="ASCII 레이싱 게임"></canvas>
-      <div id="status">WASM 엔진을 불러오는 중…</div>
+      <div id="status"><span><span class="latin">WASM</span> 엔진을 불러오는 중…</span></div>
     </section>
     <div class="controls" aria-label="터치 조작">
       <div class="pad">
@@ -65,7 +94,7 @@
       </div>
       <div class="actions"><button data-key="drift">DRIFT</button><button id="reset">RESET</button></div>
     </div>
-    <p class="hint">W / ↑ 가속 · S / ↓ 브레이크 · A D / ← → 조향 · Space 드리프트 · R 리셋</p>
+    <p class="hint"><span class="hint-item hint-accelerate"><span class="latin">W</span> / ↑ 가속</span> · <span class="hint-item hint-brake"><span class="latin">S</span> / ↓ 브레이크</span> · <span class="hint-item hint-steer"><span class="latin">A D</span> / ← → 조향</span> · <span class="hint-item hint-drift"><span class="latin">Space</span> 드리프트</span> · <span class="hint-item hint-reset"><span class="latin">R</span> 리셋</span></p>
   </main>
   <script type="module">
     const canvas = document.querySelector('#game');
@@ -86,8 +115,8 @@
       cellWidth = cellHeight / 2;
       const nextColumns = Math.max(48, Math.min(144, Math.floor(rect.width / cellWidth)));
       const nextRows = Math.max(22, Math.min(52, Math.floor(rect.height / cellHeight)));
-      cellWidth = rect.width / nextColumns;
-      cellHeight = rect.height / nextRows;
+      cellWidth = rect.width / (nextColumns + 2);
+      cellHeight = rect.height / (nextRows + 2);
       canvas.width = Math.round(rect.width * dpr);
       canvas.height = Math.round(rect.height * dpr);
       columns = nextColumns; rows = nextRows;
@@ -129,29 +158,6 @@
       const cells = new Uint32Array(memory.buffer, ptr, length);
       ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
 
-      // A faint, softly blurred color layer joins neighboring ASCII cells into
-      // readable surfaces while keeping the characters themselves crisp.
-      const surfaces = new Map();
-      for (let y = 0; y < rows; y++) {
-        for (let x = 0; x < columns; x++) {
-          const packed = cells[y * columns + x] || 32;
-          if ((packed & 255) === 32) continue;
-          const color = packed >>> 8;
-          let path = surfaces.get(color);
-          if (!path) { path = new Path2D(); surfaces.set(color, path); }
-          path.rect(x * cellWidth + .5, y * cellHeight + 1, cellWidth - 1, cellHeight - 2);
-        }
-      }
-      ctx.save();
-      ctx.globalAlpha = .18;
-      ctx.shadowBlur = Math.max(2, cellHeight * .22);
-      for (const [color, path] of surfaces) {
-        const r = color & 255, g = (color >>> 8) & 255, b = (color >>> 16) & 255;
-        ctx.fillStyle = ctx.shadowColor = `rgb(${r} ${g} ${b})`;
-        ctx.fill(path);
-      }
-      ctx.restore();
-
       ctx.save();
       ctx.globalAlpha = .92;
       for (let y = 0; y < rows; y++) {
@@ -160,7 +166,7 @@
           if (run && run.trim()) {
             const r = runColor & 255, g = (runColor >>> 8) & 255, b = (runColor >>> 16) & 255;
             ctx.fillStyle = `rgb(${r} ${g} ${b})`;
-            ctx.fillText(run, runStart * cellWidth, y * cellHeight, (x - runStart) * cellWidth);
+            ctx.fillText(run, (runStart + 1) * cellWidth, (y + 1) * cellHeight, (x - runStart) * cellWidth);
           }
         };
         for (let x = 0; x < columns; x++) {

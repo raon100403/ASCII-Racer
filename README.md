@@ -12,6 +12,8 @@ cargo run --release
 
 A window around 100 × 34 characters or larger gives a clear view. The game adapts to terminal resizing. Use `cargo run --release -- --cube` to view the rotating cube renderer check. The default four depth-tested samples per character soften thin edges; `--aa off` restores single center sampling for comparison, and `--aa 2x2` selects the default explicitly. Adjust font proportions with `--cell-aspect 0.5` (positive cell width / cell height; default `0.5`). For example: `cargo run --release -- --cell-aspect 0.6 --aa 2x2`.
 
+Use `--debug-coverage` for unassisted ribbon AA coverage, `--debug-effective-coverage` for coverage after depth and perceptual remapping, `--debug-road-marking-width` for true projected width, and `--debug-road-marking-fade` for the distance fade. Each uses grayscale glyph intensity with a faint diagnostic floor. `--debug-road-markings` shows paint contributing to resolve (green `#`), paint lost to scoring or the far fade (yellow `.`), and paint rejected by depth (red `.`). These terminal-only views do not change browser rendering.
+
 ## WebAssembly / browser
 
 Install the Rust WASM target once, build the browser version, then serve the
@@ -48,13 +50,13 @@ Drive the loop and pass the cyan checkpoint gates in order. The HUD shows speed,
 
 - `glam`: vectors and transforms for meshes, car, and camera.
 - `crossterm`: raw terminal mode, keyboard events, terminal size, and screen control.
-- `src/renderer.rs`: world-to-camera transform, perspective projection with configurable terminal-cell aspect correction, backface culling, near-plane clipping, four depth-tested samples per character, coverage-aware ASCII resolve, RGB directional lighting, and reciprocal-depth Z-buffer.
-- `src/mesh.rs`: triangles tagged with small surface classifications and primitive box meshes.
+- `src/renderer.rs`: perspective projection, near/far clipping, 2×2 depth-tested MSAA for ordinary triangles, screen-space distance coverage for road ribbons, shared depth/coverage ASCII resolve, and RGB lighting.
+- `src/mesh.rs`: triangle surface classifications, box meshes, and world-space road-ribbon render primitives.
 - `src/car.rs`: arcade acceleration, reverse, steering, friction, drifting, and the car mesh.
-- `src/track.rs`: generated road, ground, guardrails, checkpoint gates, off-road measurement, collision, and ordered lap progress.
+- `src/track.rs`: generated road, precomputed continuous edge and dashed center ribbons, guardrails, checkpoints, off-road measurement, collision, and ordered lap progress.
 - `src/main.rs`: input, chase camera, HUD, frame timing, and terminal lifetime.
 
-The renderer rasterizes triangles directly at four sub-cell positions per terminal character (one in `--aa off` mode); it does not create an image framebuffer. Each sample retains its own depth, color, lighting, and surface classification. Distant road paint that falls between all four samples gets a conservative fractional cell-overlap contribution, still depth-tested and rendered with a light glyph. Resolve combines visible coverage and surface importance into one ASCII glyph and lit foreground color per cell. HUD text overlays the scene. A full frame is assembled as one string and sent to stdout in one write, using cursor-home to overwrite the previous frame. The browser consumes the same resolved cells through `write_packed_cells()`. An RAII terminal guard restores raw mode, cursor visibility, and the previous screen on exit and during panic unwinding.
+The renderer rasterizes ordinary triangles at four sub-cell positions per terminal character (one in `--aa off` mode); it does not create an image framebuffer. Road markings are separate center segments with world-space width, color, and shade—never duplicate paint triangles. Ribbons are clipped at the near and far planes, projected with perspective-varying width, and tested only within a tight expanded screen-space bounding box. Closest-segment distance and an AA kernel yield **true coverage from the unassisted projected width**; thinner ribbons get slightly wider AA support near cell corners without changing their world width. Optical width and a gentle low-coverage remap supply **effective coverage only where true coverage is nonzero**, followed by one smooth far-distance fade. Foreground samples conservatively occlude paint before this visibility boost; visible road/ground and paint blend continuously rather than switching at a score tie. `Renderer::road_marking_cell(x, y)` exposes true and depth-resolved effective coverage, projected width, nearest screen point and direction, reciprocal-derived depth, surface, color, and brightness after a normal resolve for future glyph selection. Directional glyph selection is not implemented here. HUD text overlays the scene. A full frame is assembled as one string and sent to stdout in one write; the browser consumes the same resolved cells through `write_packed_cells()`. An RAII terminal guard restores terminal state on exit.
 
 ## Current scope and future extensions
 

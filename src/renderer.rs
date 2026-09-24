@@ -1,4 +1,4 @@
-use crate::mesh::{Mesh, SurfaceKind};
+use crate::mesh::{Mesh, RoadRibbon, SurfaceKind};
 use glam::{Vec2, Vec3};
 use std::fmt::Write as _;
 
@@ -6,6 +6,257 @@ const NEAR: f32 = 0.12;
 const FAR: f32 = 170.0;
 const SAMPLE_OFFSETS: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 const PALETTE: &[u8] = b" .:-=+*#%@";
+
+struct RibbonTuning {
+    aa_radius: f32,
+    thin_aa_radius: f32,
+    thin_width_start: f32,
+    thin_width_end: f32,
+    assisted_width: f32,
+    width_softness: f32,
+    coverage_width: f32,
+    width_contribution: f32,
+    low_boost: f32,
+    low_near_factor: f32,
+    low_softness: f32,
+    low_start: f32,
+    low_end: f32,
+    assist_start: f32,
+    assist_full: f32,
+    fade_start: f32,
+    fade_end: f32,
+    paint_priority: f32,
+    road_blend_gain: f32,
+}
+
+const RIBBON: RibbonTuning = RibbonTuning {
+    aa_radius: 0.45,
+    thin_aa_radius: std::f32::consts::FRAC_1_SQRT_2,
+    thin_width_start: 0.15,
+    thin_width_end: 0.55,
+    assisted_width: 0.4,
+    width_softness: 0.1,
+    coverage_width: 0.8,
+    width_contribution: 0.45,
+    low_boost: 0.05,
+    low_near_factor: 0.4,
+    low_softness: 0.015,
+    low_start: 0.06,
+    low_end: 0.12,
+    assist_start: 0.0,
+    assist_full: 20.0,
+    fade_start: 95.0,
+    fade_end: FAR,
+    paint_priority: 36.0,
+    road_blend_gain: 10.0,
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugView {
+    #[default]
+    Normal,
+    Coverage,
+    EffectiveCoverage,
+    Width,
+    Fade,
+    RoadMarkings,
+}
+
+/// Geometric and depth-resolved perceptual paint signals for a cell.
+/// Query after a normal or effective-coverage resolve; raw diagnostic modes
+/// intentionally leave effective coverage at zero.
+#[derive(Clone, Copy, Debug)]
+pub struct RoadMarkingCell {
+    pub true_coverage: f32,
+    pub effective_coverage: f32,
+    pub projected_width: f32,
+    pub screen_center: Vec2,
+    pub screen_direction: Vec2,
+    pub depth: f32,
+    pub color: (u8, u8, u8),
+    pub brightness: f32,
+    pub surface: SurfaceKind,
+}
+
+// Keep true AA area separate from the assisted width signal. The latter may
+// affect appearance only where the unassisted ribbon actually covers the cell.
+#[derive(Clone, Copy)]
+struct MarkingCoverage {
+    true_coverage: f32,
+    assisted_coverage: f32,
+    effective_coverage: f32,
+    projected_width: f32,
+    center: Vec2,
+    direction: Vec2,
+    inv_depth: f32,
+    color: (u8, u8, u8),
+    brightness: f32,
+}
+
+impl Default for MarkingCoverage {
+    fn default() -> Self {
+        Self {
+            true_coverage: 0.0,
+            assisted_coverage: 0.0,
+            effective_coverage: 0.0,
+            projected_width: 0.0,
+            center: Vec2::ZERO,
+            direction: Vec2::ZERO,
+            inv_depth: 0.0,
+            color: (0, 0, 0),
+            brightness: 0.0,
+        }
+    }
+}
+
+impl MarkingCoverage {
+    fn add(
+        &mut self,
+        center: Vec2,
+        direction: Vec2,
+        projected_width: f32,
+        true_coverage: f32,
+        assisted_coverage: f32,
+        inv_depth: f32,
+        color: (u8, u8, u8),
+        brightness: f32,
+    ) {
+        if self.true_coverage > 0.0 && self.color != color {
+            if inv_depth <= self.inv_depth {
+                return;
+            }
+            *self = Self::default();
+        }
+        let total = self.true_coverage + true_coverage;
+        self.center = (self.center * self.true_coverage + center * true_coverage) / total;
+        self.direction = (self.direction * self.true_coverage + direction * true_coverage) / total;
+        self.projected_width =
+            (self.projected_width * self.true_coverage + projected_width * true_coverage) / total;
+        self.inv_depth = (self.inv_depth * self.true_coverage + inv_depth * true_coverage) / total;
+        self.brightness =
+            (self.brightness * self.true_coverage + brightness * true_coverage) / total;
+        self.true_coverage = total;
+        self.assisted_coverage += assisted_coverage;
+        self.color = color;
+    }
+
+    fn depth(self) -> f32 {
+        self.inv_depth.recip()
+    }
+}
+
+fn smoothstep(start: f32, end: f32, value: f32) -> f32 {
+    let t = ((value - start) / (end - start)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+// Endpoint-only optical width; never replaces the physical projected width.
+fn ribbon_visual_width(width: f32, depth: f32) -> f32 {
+    let assistance = RIBBON.assisted_width
+        * (width / (width + RIBBON.width_softness)).sqrt()
+        * (1.0 - smoothstep(0.25, 0.7, width))
+        * smoothstep(RIBBON.assist_start, RIBBON.assist_full, depth);
+    width + assistance
+}
+
+fn marking_fade(depth: f32) -> f32 {
+    1.0 - smoothstep(RIBBON.fade_start, RIBBON.fade_end, depth)
+}
+
+// A cell's half-diagonal exceeds its center-sample AA radius. Widen only
+// the antialiasing support of thin projected ribbons, not their world width
+// or maximum opacity, so a line near a cell corner stays faintly represented.
+fn ribbon_aa_radius(width: f32) -> f32 {
+    RIBBON.aa_radius
+        + (RIBBON.thin_aa_radius - RIBBON.aa_radius)
+            * (1.0 - smoothstep(RIBBON.thin_width_start, RIBBON.thin_width_end, width))
+}
+
+fn ribbon_aa_coverage(distance: f32, width: f32, aa_radius: f32) -> f32 {
+    let half = width * 0.5;
+    let inner = half - aa_radius;
+    let outer = half + aa_radius;
+    let edge = if inner > 0.0 && distance <= inner {
+        1.0
+    } else {
+        smoothstep(outer, inner, distance)
+    };
+    edge * (width / RIBBON.coverage_width).min(1.0)
+}
+
+fn marking_visibility(
+    true_coverage: f32,
+    assisted_coverage: f32,
+    projected_width: f32,
+    depth: f32,
+) -> f32 {
+    if true_coverage <= 0.0 {
+        return 0.0; // Optical width must never create a mark outside real AA support.
+    }
+    let true_coverage = true_coverage.min(1.0);
+    let optical = true_coverage
+        + (assisted_coverage.min(1.0) - true_coverage).max(0.0) * RIBBON.width_contribution;
+    let low_coverage = true_coverage
+        + (1.0 - true_coverage)
+            * RIBBON.low_boost
+            * (true_coverage / (true_coverage + RIBBON.low_softness)).sqrt()
+            * (1.0 - smoothstep(RIBBON.low_start, RIBBON.low_end, true_coverage))
+            * (1.0
+                - smoothstep(
+                    RIBBON.thin_width_start,
+                    RIBBON.thin_width_end,
+                    projected_width,
+                ))
+            * (RIBBON.low_near_factor
+                + (1.0 - RIBBON.low_near_factor) * smoothstep(6.0, 35.0, depth));
+    optical.max(low_coverage).min(1.0) * marking_fade(depth)
+}
+
+fn shade(sample: Sample, coverage: f32) -> (f32, (u8, u8, u8)) {
+    let lighting = sample.brightness.clamp(0.0, 1.0);
+    // Paint has no fixed glyph floor; other important surfaces retain theirs.
+    let intensity = if sample.surface == SurfaceKind::RoadMarking {
+        0.65 * coverage.sqrt() * (0.45 + 0.55 * lighting)
+    } else {
+        (coverage * (0.12 + 0.40 * lighting)).max(if sample.surface.important() {
+            0.17
+        } else {
+            0.0
+        })
+    };
+    let color_scale = (0.38 + 0.62 * lighting) * (0.72 + 0.28 * coverage);
+    let lit = |channel: u8| (channel as f32 * color_scale).round().clamp(0.0, 255.0) as u8;
+    (
+        intensity,
+        (
+            lit(sample.color.0),
+            lit(sample.color.1),
+            lit(sample.color.2),
+        ),
+    )
+}
+
+fn resolved_cell(intensity: f32, depth: f32, color: (u8, u8, u8)) -> Cell {
+    let index = (intensity * (PALETTE.len() - 1) as f32).round() as usize;
+    Cell {
+        ch: PALETTE[index] as char,
+        depth,
+        color,
+    }
+}
+
+fn debug_marking(strength: f32, depth: f32) -> Cell {
+    if strength <= 0.0 {
+        return Cell::default();
+    }
+    let level = strength.min(1.0).sqrt();
+    let gray = (level * 255.0).round().max(48.0) as u8;
+    Cell {
+        ch: PALETTE[(level * 9.0).round().max(1.0) as usize] as char,
+        depth,
+        color: (gray, gray, gray),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AaMode {
@@ -71,14 +322,31 @@ struct Vertex {
     pos: Vec3,
 }
 
+// Projected paint kept as a continuous width/depth/direction primitive.
+#[derive(Clone, Copy)]
+struct ProjectedRibbon {
+    start: Vec2,
+    end: Vec2,
+    width_start: f32,
+    width_end: f32,
+    inv_z_start: f32,
+    inv_z_end: f32,
+    direction: Vec2,
+    inv_length_squared: f32,
+    color: (u8, u8, u8),
+    brightness: f32,
+}
+
 pub struct Renderer {
     pub width: usize,
     pub height: usize,
     cells: Vec<Cell>,
     samples: Vec<Sample>,
+    markings: Vec<MarkingCoverage>,
     color: bool,
     cell_aspect: f32,
     aa: AaMode,
+    debug_view: DebugView,
 }
 
 impl Renderer {
@@ -99,9 +367,11 @@ impl Renderer {
             height,
             cells: vec![Cell::default(); width * height],
             samples: vec![Sample::default(); width * height * aa.count()],
+            markings: vec![MarkingCoverage::default(); width * height],
             color,
             cell_aspect,
             aa,
+            debug_view: DebugView::Normal,
         }
     }
 
@@ -111,12 +381,41 @@ impl Renderer {
         self.cells.resize(width * height, Cell::default());
         self.samples
             .resize(width * height * self.aa.count(), Sample::default());
+        self.markings
+            .resize(width * height, MarkingCoverage::default());
         self.clear();
     }
 
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.samples.fill(Sample::default());
+        self.markings.fill(MarkingCoverage::default());
+    }
+
+    pub fn set_debug_view(&mut self, view: DebugView) {
+        self.debug_view = view;
+    }
+
+    /// Paint data after the last normal or effective-coverage resolve.
+    /// Depth occlusion or fade zeroes effective, never geometric, coverage.
+    pub fn road_marking_cell(&self, x: usize, y: usize) -> Option<RoadMarkingCell> {
+        let marking = self
+            .markings
+            .get(y.checked_mul(self.width)?.checked_add(x)?)?;
+        if x >= self.width || marking.true_coverage <= 0.0 {
+            return None;
+        }
+        Some(RoadMarkingCell {
+            true_coverage: marking.true_coverage.min(1.0),
+            effective_coverage: marking.effective_coverage,
+            projected_width: marking.projected_width,
+            screen_center: marking.center,
+            screen_direction: marking.direction.normalize_or_zero(),
+            depth: marking.depth(),
+            color: marking.color,
+            brightness: marking.brightness,
+            surface: SurfaceKind::RoadMarking,
+        })
     }
 
     pub fn text(&mut self, x: usize, y: usize, value: &str) {
@@ -141,6 +440,9 @@ impl Renderer {
         let up = forward.cross(right);
         let light = Vec3::new(-0.35, 0.85, -0.4).normalize();
         for triangle in &mesh.triangles {
+            if triangle.surface == SurfaceKind::RoadMarking {
+                continue; // Paint is exclusively drawn from RoadRibbon.
+            }
             let world = triangle.vertices;
             let normal = (world[1] - world[0])
                 .cross(world[2] - world[0])
@@ -168,6 +470,152 @@ impl Renderer {
                     brightness,
                     triangle.color,
                     triangle.surface,
+                );
+            }
+        }
+    }
+
+    /// Road paint uses projected world-space centerlines, never point-sampled triangles.
+    pub fn draw_ribbons(&mut self, ribbons: &[RoadRibbon], camera: Camera) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        let forward = (camera.target - camera.position).normalize_or_zero();
+        let right = Vec3::Y.cross(forward).normalize_or_zero();
+        let up = forward.cross(right);
+        let scale = self.height as f32 / (2.0 * (70.0_f32.to_radians() * 0.5).tan());
+        let horizontal_scale = scale / self.cell_aspect;
+        let screen_center = Vec2::new(self.width as f32 * 0.5, self.height as f32 * 0.5);
+        let light = Vec3::new(-0.35, 0.85, -0.4).normalize();
+        let to_view = |p: Vec3| {
+            let d = p - camera.position;
+            Vec3::new(d.dot(right), d.dot(up), d.dot(forward))
+        };
+        let project = |p: Vec3| {
+            let inv_z = p.z.recip();
+            screen_center + Vec2::new(p.x * inv_z * horizontal_scale, -p.y * inv_z * scale)
+        };
+        for ribbon in ribbons {
+            if ribbon.width <= 0.0 {
+                continue;
+            }
+            let axis = ribbon.end - ribbon.start;
+            let lateral = Vec3::new(-axis.z, 0.0, axis.x).normalize_or_zero();
+            if lateral == Vec3::ZERO {
+                continue;
+            }
+            let lateral = lateral * (ribbon.width * 0.5);
+            let lateral_view = Vec3::new(lateral.dot(right), lateral.dot(up), lateral.dot(forward));
+            let mut a = to_view(ribbon.start);
+            let mut b = to_view(ribbon.end);
+            if (a.z < NEAR && b.z < NEAR) || (a.z > FAR && b.z > FAR) {
+                continue;
+            }
+            // Clip before projection: a crossing endpoint never creates a
+            // huge or negative screen-space coordinate.
+            if a.z < NEAR {
+                a = a.lerp(b, (NEAR - a.z) / (b.z - a.z));
+            } else if b.z < NEAR {
+                b = b.lerp(a, (NEAR - b.z) / (a.z - b.z));
+            }
+            if a.z > FAR {
+                a = a.lerp(b, (FAR - a.z) / (b.z - a.z));
+            } else if b.z > FAR {
+                b = b.lerp(a, (FAR - b.z) / (a.z - b.z));
+            }
+            let screen_a = project(a);
+            let screen_b = project(b);
+            let ab = screen_b - screen_a;
+            let length_squared = ab.length_squared();
+            let (direction, inv_length_squared) = if length_squared > 1e-8 {
+                let mut direction = ab / length_squared.sqrt();
+                // Undirected line: stable orientation when a segment is reversed.
+                if direction.x < 0.0 || (direction.x == 0.0 && direction.y < 0.0) {
+                    direction = -direction;
+                }
+                (direction, length_squared.recip())
+            } else {
+                (Vec2::X, 0.0)
+            };
+            let projected_half_width = |p: Vec3| {
+                let inv_z = p.z.recip();
+                let displacement = Vec2::new(
+                    (lateral_view.x - p.x * lateral_view.z * inv_z) * inv_z * horizontal_scale,
+                    -(lateral_view.y - p.y * lateral_view.z * inv_z) * inv_z * scale,
+                );
+                if inv_length_squared > 0.0 {
+                    displacement.perp_dot(direction).abs()
+                } else {
+                    displacement.length()
+                }
+            };
+            self.rasterize_ribbon(ProjectedRibbon {
+                start: screen_a,
+                end: screen_b,
+                width_start: 2.0 * projected_half_width(a),
+                width_end: 2.0 * projected_half_width(b),
+                inv_z_start: a.z.recip(),
+                inv_z_end: b.z.recip(),
+                direction,
+                inv_length_squared,
+                color: ribbon.color,
+                brightness: (0.22 + 0.78 * light.y) * ribbon.shade,
+            });
+        }
+    }
+    fn rasterize_ribbon(&mut self, ribbon: ProjectedRibbon) {
+        let width_a = ribbon_visual_width(ribbon.width_start, ribbon.inv_z_start.recip());
+        let width_b = ribbon_visual_width(ribbon.width_end, ribbon.inv_z_end.recip());
+        let aa_a = ribbon_aa_radius(ribbon.width_start);
+        let aa_b = ribbon_aa_radius(ribbon.width_end);
+        let radius = ribbon.width_start.max(ribbon.width_end) * 0.5 + aa_a.max(aa_b);
+        let min = ribbon.start.min(ribbon.end) - Vec2::splat(radius + 0.5);
+        let max = ribbon.start.max(ribbon.end) + Vec2::splat(radius - 0.5);
+        if max.x < 0.0 || max.y < 0.0 || min.x >= self.width as f32 || min.y >= self.height as f32 {
+            return;
+        }
+        let min_x = min.x.ceil().max(0.0) as usize;
+        let min_y = min.y.ceil().max(0.0) as usize;
+        let max_x = max.x.floor().min((self.width - 1) as f32) as usize;
+        let max_y = max.y.floor().min((self.height - 1) as f32) as usize;
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+        let ab = ribbon.end - ribbon.start;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let t = ((p - ribbon.start).dot(ab) * ribbon.inv_length_squared).clamp(0.0, 1.0);
+                let closest = ribbon.start + ab * t;
+                let distance_squared = (p - closest).length_squared();
+                let projected_width =
+                    ribbon.width_start + (ribbon.width_end - ribbon.width_start) * t;
+                let aa = aa_a + (aa_b - aa_a) * t;
+                let outer = projected_width * 0.5 + aa;
+                if distance_squared >= outer * outer {
+                    continue;
+                }
+                let distance = distance_squared.sqrt();
+                let true_coverage = ribbon_aa_coverage(distance, projected_width, aa);
+                if true_coverage <= 0.0 {
+                    continue;
+                }
+                let assisted_width = width_a + (width_b - width_a) * t;
+                let assisted_coverage = if assisted_width > projected_width {
+                    ribbon_aa_coverage(distance, assisted_width, aa)
+                } else {
+                    true_coverage
+                };
+                let inv_depth = ribbon.inv_z_start + (ribbon.inv_z_end - ribbon.inv_z_start) * t;
+                self.markings[y * self.width + x].add(
+                    (closest - Vec2::new(x as f32, y as f32)).clamp(Vec2::ZERO, Vec2::ONE),
+                    ribbon.direction,
+                    projected_width,
+                    true_coverage,
+                    assisted_coverage,
+                    inv_depth,
+                    ribbon.color,
+                    ribbon.brightness,
                 );
             }
         }
@@ -221,13 +669,8 @@ impl Renderer {
         let count = self.aa.count();
         for y in min_y..=max_y {
             for x in min_x..=max_x {
-                let mut hit = false;
-                for sample_index in 0..count {
-                    let (dx, dy) = if count == 1 {
-                        (0.5, 0.5)
-                    } else {
-                        SAMPLE_OFFSETS[sample_index]
-                    };
+                for (sample_index, &offset) in SAMPLE_OFFSETS.iter().enumerate().take(count) {
+                    let (dx, dy) = if count == 1 { (0.5, 0.5) } else { offset };
                     let p = Vec2::new(x as f32 + dx, y as f32 + dy);
                     let w0 = edge(screen[1], screen[2], p) / area;
                     let w1 = edge(screen[2], screen[0], p) / area;
@@ -243,7 +686,6 @@ impl Renderer {
                     if z > FAR {
                         continue;
                     }
-                    hit = true;
                     let sample = &mut self.samples[(y * self.width + x) * count + sample_index];
                     if z < sample.depth {
                         *sample = Sample {
@@ -255,76 +697,73 @@ impl Renderer {
                         };
                     }
                 }
-                // A long distant paint strip can pass between all four point samples.
-                // Clip only such misses against the cell; keep a fractional, depth-tested
-                // contribution rather than inflating its world-space width.
-                if count == 4 && surface == SurfaceKind::RoadMarking && !hit {
-                    if let Some((centroid, area_covered)) = triangle_cell_overlap(screen, x, y) {
-                        let w0 = edge(screen[1], screen[2], centroid) / area;
-                        let w1 = edge(screen[2], screen[0], centroid) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        let inv_z = w0 * inv_depth[0] + w1 * inv_depth[1] + w2 * inv_depth[2];
-                        if inv_z > 0.0 {
-                            let z = inv_z.recip();
-                            if z <= FAR {
-                                let index = SAMPLE_OFFSETS
-                                    .iter()
-                                    .enumerate()
-                                    .min_by(|(_, a), (_, b)| {
-                                        let distance = |offset: &(f32, f32)| {
-                                            (centroid
-                                                - Vec2::new(
-                                                    x as f32 + offset.0,
-                                                    y as f32 + offset.1,
-                                                ))
-                                            .length_squared()
-                                        };
-                                        distance(a).total_cmp(&distance(b))
-                                    })
-                                    .unwrap()
-                                    .0;
-                                let sample =
-                                    &mut self.samples[(y * self.width + x) * count + index];
-                                if z < sample.depth {
-                                    *sample = Sample {
-                                        depth: z,
-                                        color,
-                                        brightness,
-                                        surface,
-                                        coverage: (area_covered * count as f32).min(1.0),
-                                    };
-                                } else if sample.surface == surface
-                                    && sample.color == color
-                                    && (sample.depth - z).abs() < z * 0.01
-                                {
-                                    sample.coverage =
-                                        (sample.coverage + area_covered * count as f32).min(1.0);
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
 
     fn resolve(&mut self) {
         let count = self.aa.count();
-        for (cell, samples) in self.cells.iter_mut().zip(self.samples.chunks_exact(count)) {
-            // Text is an overlay; it must not be replaced by the 3D resolve.
+        for ((cell, samples), marking) in self
+            .cells
+            .iter_mut()
+            .zip(self.samples.chunks_exact(count))
+            .zip(&mut self.markings)
+        {
+            marking.effective_coverage = 0.0;
             if cell.depth < 0.0 {
-                continue;
+                continue; // HUD overlay
             }
-            let mut winner = None;
+            let marking_depth = if marking.true_coverage > 0.0 {
+                marking.depth()
+            } else {
+                f32::INFINITY
+            };
+            match self.debug_view {
+                DebugView::Coverage => {
+                    *cell = debug_marking(marking.true_coverage, marking_depth);
+                    continue;
+                }
+                DebugView::Width => {
+                    *cell = debug_marking(
+                        if marking.true_coverage > 0.0 {
+                            marking.projected_width / RIBBON.coverage_width
+                        } else {
+                            0.0
+                        },
+                        marking_depth,
+                    );
+                    continue;
+                }
+                DebugView::Fade => {
+                    *cell = debug_marking(
+                        if marking.true_coverage > 0.0 {
+                            marking_fade(marking_depth)
+                        } else {
+                            0.0
+                        },
+                        marking_depth,
+                    );
+                    continue;
+                }
+                _ => {}
+            }
+
+            let nearest_depth = samples.iter().fold(marking_depth, |z, s| z.min(s.depth));
+            // Foreground samples conservatively occlude covered ribbon cells.
+            // Coplanar road/ground can still compete by coverage.
+            let visible_marking = marking.true_coverage > 0.0
+                && marking_depth <= nearest_depth * 1.08
+                && !samples.iter().any(|s| {
+                    s.depth < marking_depth
+                        && !matches!(s.surface, SurfaceKind::Road | SurfaceKind::Ground)
+                });
+            let mut winner: Option<(Sample, f32)> = None;
             let mut best_score = 0.0;
-            let nearest_depth = samples.iter().fold(f32::INFINITY, |z, s| z.min(s.depth));
             for candidate in samples.iter().filter(|s| s.depth.is_finite()) {
-                // A genuinely nearer surface occludes even an important distant marking.
-                // Nearby coplanar road/paint samples may still compete by coverage.
                 if candidate.depth > nearest_depth * 1.08 {
                     continue;
                 }
-                let covered = samples
+                let coverage = samples
                     .iter()
                     .filter(|s| {
                         s.surface == candidate.surface
@@ -333,8 +772,10 @@ impl Renderer {
                             && s.depth <= candidate.depth * 1.08
                             && candidate.depth <= s.depth * 1.08
                     })
-                    .count();
-                let score = covered as f32
+                    .map(|s| s.coverage)
+                    .sum::<f32>()
+                    / count as f32;
+                let score = coverage
                     * if candidate.surface.important() {
                         3.2
                     } else {
@@ -342,47 +783,97 @@ impl Renderer {
                     };
                 if score > best_score
                     || (score == best_score
-                        && winner.is_none_or(|w: Sample| candidate.depth < w.depth))
+                        && winner.is_none_or(|(w, _)| candidate.depth < w.depth))
                 {
                     best_score = score;
-                    winner = Some(*candidate);
+                    winner = Some((*candidate, coverage));
                 }
             }
-            if let Some(sample) = winner {
-                let coverage: f32 = samples
-                    .iter()
-                    .filter(|s| {
-                        s.surface == sample.surface
-                            && s.color == sample.color
-                            && s.depth.is_finite()
-                            && s.depth <= sample.depth * 1.08
-                            && sample.depth <= s.depth * 1.08
-                    })
-                    .map(|s| s.coverage)
-                    .sum::<f32>()
-                    / count as f32;
-                let lighting = sample.brightness.clamp(0.0, 1.0);
-                // Coverage carries silhouettes; RGB carries most of the lighting.
-                // Keep fully covered ground and road in the lighter ASCII ranks.
-                let intensity =
-                    (coverage * (0.12 + 0.40 * lighting)).max(if sample.surface.important() {
-                        0.17
-                    } else {
-                        0.0
-                    });
-                let index = (intensity * (PALETTE.len() - 1) as f32).round() as usize;
-                let color_scale = (0.38 + 0.62 * lighting) * (0.72 + 0.28 * coverage);
-                let lit =
-                    |channel: u8| (channel as f32 * color_scale).round().clamp(0.0, 255.0) as u8;
-                *cell = Cell {
-                    ch: PALETTE[index] as char,
-                    depth: sample.depth,
-                    color: (
-                        lit(sample.color.0),
-                        lit(sample.color.1),
-                        lit(sample.color.2),
-                    ),
+            let road_background = winner.filter(|(sample, _)| {
+                matches!(sample.surface, SurfaceKind::Road | SurfaceKind::Ground)
+            });
+            let effective = if visible_marking {
+                marking_visibility(
+                    marking.true_coverage,
+                    marking.assisted_coverage,
+                    marking.projected_width,
+                    marking_depth,
+                )
+            } else {
+                0.0
+            };
+            marking.effective_coverage = effective;
+            if self.debug_view == DebugView::EffectiveCoverage {
+                *cell = debug_marking(effective, marking_depth);
+                continue;
+            }
+            let paint_present = effective > 0.0;
+            if paint_present && effective * RIBBON.paint_priority > best_score {
+                winner = Some((
+                    Sample {
+                        depth: marking_depth,
+                        color: marking.color,
+                        brightness: marking.brightness,
+                        surface: SurfaceKind::RoadMarking,
+                        coverage: effective,
+                    },
+                    effective,
+                ));
+            }
+            if self.debug_view == DebugView::RoadMarkings {
+                *cell = if marking.true_coverage > 0.0 {
+                    let contributes = paint_present
+                        && (road_background.is_some()
+                            || winner.is_some_and(|(sample, _)| {
+                                sample.surface == SurfaceKind::RoadMarking
+                            }));
+                    Cell {
+                        ch: if contributes { '#' } else { '.' },
+                        depth: marking_depth,
+                        color: if contributes {
+                            (0, 255, 0)
+                        } else if visible_marking {
+                            (255, 255, 0) // distance fade or coverage lost during scoring
+                        } else {
+                            (255, 0, 0) // depth rejection
+                        },
+                    }
+                } else {
+                    Cell::default()
                 };
+                continue;
+            }
+            if let Some((road, road_coverage)) = road_background.filter(|_| paint_present) {
+                // Paint and road are two layers of the same surface. Blend even
+                // when paint's score falls below road's: otherwise a distant
+                // line switches abruptly from yellow to bare road at that tie.
+                let (road_intensity, road_color) = shade(road, road_coverage);
+                let paint = Sample {
+                    depth: marking_depth,
+                    color: marking.color,
+                    brightness: marking.brightness,
+                    surface: SurfaceKind::RoadMarking,
+                    coverage: effective,
+                };
+                let (paint_intensity, paint_color) = shade(paint, effective);
+                let opacity = 1.0 - (-RIBBON.road_blend_gain * effective).exp();
+                let intensity = road_intensity
+                    + opacity * (paint_intensity.max(road_intensity + 0.15) - road_intensity);
+                let mix = |base: u8, paint: u8| {
+                    (base as f32 + (paint as f32 - base as f32) * opacity).round() as u8
+                };
+                *cell = resolved_cell(
+                    intensity,
+                    marking_depth,
+                    (
+                        mix(road_color.0, paint_color.0),
+                        mix(road_color.1, paint_color.1),
+                        mix(road_color.2, paint_color.2),
+                    ),
+                );
+            } else if let Some((sample, coverage)) = winner {
+                let (intensity, color) = shade(sample, coverage);
+                *cell = resolved_cell(intensity, sample.depth, color);
             } else {
                 *cell = Cell::default();
             }
@@ -446,63 +937,62 @@ fn clip_near(input: &[Vertex; 3]) -> ([Vertex; 4], usize) {
     (output, len)
 }
 
-// Area and centroid of a projected triangle clipped to one terminal cell.
-// This is only used for missed road paint; the hot path stays four point tests.
-fn triangle_cell_overlap(triangle: [Vec2; 3], x: usize, y: usize) -> Option<(Vec2, f32)> {
-    let mut polygon = [Vec2::ZERO; 8];
-    polygon[..3].copy_from_slice(&triangle);
-    let mut len = 3;
-    let mut next = [Vec2::ZERO; 8];
-    for side in 0..4 {
-        let distance = |p: Vec2| match side {
-            0 => p.x - x as f32,
-            1 => x as f32 + 1.0 - p.x,
-            2 => p.y - y as f32,
-            _ => y as f32 + 1.0 - p.y,
-        };
-        let mut n = 0;
-        for i in 0..len {
-            let a = polygon[i];
-            let b = polygon[(i + 1) % len];
-            let da = distance(a);
-            let db = distance(b);
-            if (da >= 0.0) != (db >= 0.0) {
-                next[n] = a.lerp(b, da / (da - db));
-                n += 1;
-            }
-            if db >= 0.0 {
-                next[n] = b;
-                n += 1;
-            }
-        }
-        if n < 3 {
-            return None;
-        }
-        std::mem::swap(&mut polygon, &mut next);
-        len = n;
-    }
-    let mut twice_area = 0.0;
-    let mut centroid = Vec2::ZERO;
-    for i in 0..len {
-        let a = polygon[i];
-        let b = polygon[(i + 1) % len];
-        let cross = a.perp_dot(b);
-        twice_area += cross;
-        centroid += a;
-    }
-    let area = twice_area.abs() * 0.5;
-    if area < 0.01 {
-        return None;
-    }
-    Some((centroid / len as f32, area.min(1.0)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mesh::Mesh;
     use crate::{car::Car, track::Track};
     use glam::{Mat4, Vec3};
+    const CELL_INDEX: usize = 12 * 50 + 25;
+    const PAINT: (u8, u8, u8) = (245, 225, 145);
+
+    fn screen_vertex(p: Vec2, depth: f32) -> Vertex {
+        let scale = 25.0 / (2.0 * (70.0_f32.to_radians() * 0.5).tan());
+        Vertex {
+            pos: Vec3::new(
+                (p.x - 25.0) * depth * 0.5 / scale,
+                (12.5 - p.y) * depth / scale,
+                depth,
+            ),
+        }
+    }
+
+    fn screen_ribbon(
+        start: Vec2,
+        end: Vec2,
+        widths: [f32; 2],
+        depths: [f32; 2],
+    ) -> ProjectedRibbon {
+        let ab = end - start;
+        let length_squared = ab.length_squared();
+        let mut direction = ab / length_squared.sqrt();
+        if direction.x < 0.0 || (direction.x == 0.0 && direction.y < 0.0) {
+            direction = -direction;
+        }
+        ProjectedRibbon {
+            start,
+            end,
+            width_start: widths[0],
+            width_end: widths[1],
+            inv_z_start: depths[0].recip(),
+            inv_z_end: depths[1].recip(),
+            direction,
+            inv_length_squared: length_squared.recip(),
+            color: PAINT,
+            brightness: 1.0,
+        }
+    }
+
+    fn paint_strip(renderer: &mut Renderer, center: Vec2, degrees: f32, width: f32, depth: f32) {
+        let angle = degrees.to_radians();
+        let along = Vec2::new(angle.cos(), angle.sin()) * 0.7;
+        renderer.rasterize_ribbon(screen_ribbon(
+            center - along,
+            center + along,
+            [width; 2],
+            [depth; 2],
+        ));
+    }
 
     #[test]
     fn cube_renders_and_camera_changes_image() {
@@ -578,6 +1068,7 @@ mod tests {
             target: Vec3::new(0.0, 0.8, 3.0),
         };
         renderer.draw_mesh(&track.mesh, camera);
+        renderer.draw_ribbons(&track.ribbons, camera);
         renderer.draw_mesh(&car.mesh(), camera);
         renderer.resolve();
         let red_cells = renderer
@@ -598,75 +1089,45 @@ mod tests {
     #[test]
     fn subcell_marking_survives_without_center_coverage() {
         let mut renderer = Renderer::new(50, 25, false);
-        let a = Vertex {
-            pos: Vec3::new(0.018, -0.6, 5.0),
-        };
-        let b = Vertex {
-            pos: Vec3::new(0.05, -0.6, 5.0),
-        };
-        let c = Vertex {
-            pos: Vec3::new(0.05, 0.6, 5.0),
-        };
-        let d = Vertex {
-            pos: Vec3::new(0.018, 0.6, 5.0),
-        };
-        renderer.rasterize([a, b, c], 1.0, (245, 225, 145), SurfaceKind::RoadMarking);
-        renderer.rasterize([a, c, d], 1.0, (245, 225, 145), SurfaceKind::RoadMarking);
+        paint_strip(&mut renderer, Vec2::new(25.38, 12.5), 90.0, 0.02, 5.0);
         renderer.resolve();
-        assert_ne!(renderer.cells[12 * 50 + 25].ch, ' ');
-        assert_ne!(renderer.cells[12 * 50 + 25].ch, '@');
-        assert_eq!(
-            renderer.samples[(12 * 50 + 25) * 4..(12 * 50 + 26) * 4]
+        assert!(renderer.markings[CELL_INDEX].true_coverage > 0.0);
+        assert_ne!(renderer.cells[CELL_INDEX].ch, ' ');
+        assert!(
+            renderer.samples[CELL_INDEX * 4..CELL_INDEX * 4 + 4]
                 .iter()
-                .filter(|s| s.depth.is_finite())
-                .count(),
-            2
+                .all(|s| !s.depth.is_finite())
         );
         let mut off = Renderer::with_options(50, 25, false, 0.5, AaMode::Off);
-        off.rasterize([a, b, c], 1.0, (245, 225, 145), SurfaceKind::RoadMarking);
-        off.rasterize([a, c, d], 1.0, (245, 225, 145), SurfaceKind::RoadMarking);
+        paint_strip(&mut off, Vec2::new(25.38, 12.5), 90.0, 0.02, 5.0);
         off.resolve();
-        assert_eq!(off.cells[12 * 50 + 25].ch, ' ');
+        assert_eq!(off.cells[CELL_INDEX].ch, renderer.cells[CELL_INDEX].ch);
     }
 
     #[test]
     fn nearer_surface_hides_thin_marking_even_when_drawn_first() {
         let mut renderer = Renderer::new(50, 25, true);
-        let marking = [
-            Vertex {
-                pos: Vec3::new(0.018, -0.6, 5.0),
-            },
-            Vertex {
-                pos: Vec3::new(0.05, -0.6, 5.0),
-            },
-            Vertex {
-                pos: Vec3::new(0.05, 0.6, 5.0),
-            },
-        ];
         let foreground = [
-            Vertex {
-                pos: Vec3::new(-1.0, -1.0, 3.0),
-            },
-            Vertex {
-                pos: Vec3::new(1.0, -1.0, 3.0),
-            },
-            Vertex {
-                pos: Vec3::new(0.0, 1.0, 3.0),
-            },
+            screen_vertex(Vec2::new(24.0, 13.5), 3.0),
+            screen_vertex(Vec2::new(26.0, 13.5), 3.0),
+            screen_vertex(Vec2::new(25.0, 11.5), 3.0),
         ];
         for near_first in [false, true] {
             renderer.clear();
             if near_first {
                 renderer.rasterize(foreground, 0.8, (255, 0, 0), SurfaceKind::Vehicle);
             }
-            renderer.rasterize(marking, 1.0, (245, 225, 145), SurfaceKind::RoadMarking);
+            paint_strip(&mut renderer, Vec2::new(25.5, 12.5), 90.0, 0.08, 5.0);
             if !near_first {
                 renderer.rasterize(foreground, 0.8, (255, 0, 0), SurfaceKind::Vehicle);
             }
             renderer.resolve();
-            let cell = renderer.cells[12 * 50 + 25];
+            let cell = renderer.cells[CELL_INDEX];
             assert!(cell.color.0 > 0 && cell.color.1 == 0 && cell.color.2 == 0);
             assert!((cell.depth - 3.0).abs() < 0.01);
+            let paint = renderer.road_marking_cell(25, 12).unwrap();
+            assert!(paint.true_coverage > 0.0);
+            assert_eq!(paint.effective_coverage, 0.0);
         }
     }
 
@@ -725,61 +1186,416 @@ mod tests {
     }
 
     #[test]
-    fn distant_marking_between_all_four_samples_remains_lightly_visible() {
+    fn diagonal_between_msaa_points_retains_ribbon_coverage() {
         let mut renderer = Renderer::new(50, 25, true);
-        let a = Vertex {
-            pos: Vec3::new(0.4, -10.0, 50.0),
-        };
-        let b = Vertex {
-            pos: Vec3::new(0.56, -10.0, 50.0),
-        };
-        let c = Vertex {
-            pos: Vec3::new(0.56, 10.0, 50.0),
-        };
-        let d = Vertex {
-            pos: Vec3::new(0.4, 10.0, 50.0),
-        };
-        for shift in [0.0, 0.1, 0.2, 0.3] {
+        let angle = 45.0_f32.to_radians();
+        let normal = Vec2::new(-angle.sin(), angle.cos());
+        let center = Vec2::new(25.5, 12.5) + normal * 0.12;
+        for (dx, dy) in SAMPLE_OFFSETS {
+            let sample = Vec2::new(25.0 + dx, 12.0 + dy);
+            assert!((sample - center).dot(normal).abs() > 0.02);
+        }
+        paint_strip(&mut renderer, center, 45.0, 0.04, 50.0);
+        assert!(
+            renderer.samples[CELL_INDEX * 4..CELL_INDEX * 4 + 4]
+                .iter()
+                .all(|s| !s.depth.is_finite())
+        );
+        assert!(renderer.markings[CELL_INDEX].true_coverage > 0.0);
+        let observed = renderer.markings[CELL_INDEX].direction.normalize();
+        assert!(observed.dot(Vec2::new(angle.cos(), angle.sin())) > 0.99);
+        assert!(renderer.markings[CELL_INDEX].center.min_element() >= 0.0);
+        assert!(renderer.markings[CELL_INDEX].center.max_element() <= 1.0);
+        renderer.resolve();
+        assert_ne!(renderer.cells[CELL_INDEX].ch, ' ');
+        assert!((renderer.cells[CELL_INDEX].depth - 50.0).abs() < 0.01);
+        let paint = renderer.road_marking_cell(25, 12).unwrap();
+        assert!(paint.true_coverage > 0.0 && paint.true_coverage < 0.04);
+        assert!(paint.effective_coverage > paint.true_coverage && paint.effective_coverage < 0.2);
+        assert!((paint.projected_width - 0.04).abs() < 1e-5);
+        assert!(
+            paint
+                .screen_direction
+                .dot(Vec2::new(angle.cos(), angle.sin()))
+                > 0.99
+        );
+        assert_eq!(paint.surface, SurfaceKind::RoadMarking);
+        assert_eq!(paint.color, PAINT);
+        assert!(paint.brightness > 0.0);
+    }
+
+    #[test]
+    fn zero_geometric_support_never_creates_optical_ghosts() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let optical_width = ribbon_visual_width(0.01, 50.0);
+        let aa = ribbon_aa_radius(0.01);
+        assert!(ribbon_aa_coverage(0.75, optical_width, aa) > 0.0);
+        assert_eq!(ribbon_aa_coverage(0.75, 0.01, aa), 0.0);
+        paint_strip(&mut renderer, Vec2::new(25.5, 11.75), 0.0, 0.01, 50.0);
+        renderer.resolve();
+        assert!(renderer.road_marking_cell(25, 12).is_none());
+        assert_eq!(renderer.cells[CELL_INDEX].ch, ' ');
+        assert_eq!(marking_visibility(0.0, 0.3, 0.01, 50.0), 0.0);
+    }
+
+    #[test]
+    fn rotating_thin_paint_keeps_continuous_coverage_and_visibility() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let mut previous: Option<f32> = None;
+        let mut saw_point_hit = false;
+        let mut saw_point_miss = false;
+        for degrees in [
+            0.0_f32, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 75.0, 90.0,
+        ] {
             renderer.clear();
-            let shifted = |v: Vertex| Vertex {
-                pos: v.pos + Vec3::X * shift,
-            };
+            let angle = degrees.to_radians();
+            let normal = Vec2::new(-angle.sin(), angle.cos());
+            let center = Vec2::new(25.5, 12.5) + normal * 0.12;
+            let along = Vec2::new(angle.cos(), angle.sin());
+            let hit = SAMPLE_OFFSETS.iter().any(|&(dx, dy)| {
+                let delta = Vec2::new(25.0 + dx, 12.0 + dy) - center;
+                delta.dot(normal).abs() < 0.02 && delta.dot(along).abs() < 0.7
+            });
+            saw_point_hit |= hit;
+            saw_point_miss |= !hit;
+            paint_strip(&mut renderer, center, degrees, 0.04, 45.0);
+            let coverage = renderer.markings[CELL_INDEX].true_coverage;
+            assert!(coverage > 0.0, "lost coverage at {degrees}°");
+            if let Some(previous) = previous {
+                assert!(
+                    (coverage - previous).abs() < 0.1,
+                    "coverage jumped at {degrees}°: {previous} -> {coverage}"
+                );
+            }
+            previous = Some(coverage);
+            renderer.resolve();
+            assert_ne!(renderer.cells[CELL_INDEX].ch, ' ', "missing at {degrees}°");
+        }
+        assert!(
+            saw_point_hit && saw_point_miss,
+            "test must cross the point-hit boundary"
+        );
+    }
+
+    #[test]
+    fn very_thin_ribbon_contributes_to_road_color() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let corners = [
+            Vec2::new(25.0, 12.0),
+            Vec2::new(25.0, 13.0),
+            Vec2::new(26.0, 13.0),
+            Vec2::new(26.0, 12.0),
+        ]
+        .map(|p| screen_vertex(p, 5.03));
+        renderer.rasterize(
+            [corners[0], corners[1], corners[2]],
+            0.6,
+            (87, 91, 96),
+            SurfaceKind::Road,
+        );
+        renderer.rasterize(
+            [corners[0], corners[2], corners[3]],
+            0.6,
+            (87, 91, 96),
+            SurfaceKind::Road,
+        );
+        renderer.resolve();
+        let bare_road = renderer.cells[CELL_INDEX].color;
+        paint_strip(&mut renderer, Vec2::new(25.105, 12.5), 90.0, 0.005, 5.0);
+        let coverage = renderer.markings[CELL_INDEX].true_coverage;
+        assert!(coverage > 0.0 && coverage < 0.01, "{coverage}");
+        renderer.resolve();
+        let cell = renderer.cells[CELL_INDEX];
+        assert_ne!(cell.ch, ' ');
+        assert!(
+            cell.color.0 > bare_road.0 && cell.color.1 > bare_road.1 && cell.color.2 >= bare_road.2,
+            "paint made no visible contribution: {:?} -> {:?}",
+            bare_road,
+            cell.color
+        );
+        assert!((cell.depth - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn faint_marking_remains_distinct_over_road_as_view_shifts() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let corners = [
+            Vec2::new(25.0, 12.0),
+            Vec2::new(25.0, 13.0),
+            Vec2::new(26.0, 13.0),
+            Vec2::new(26.0, 12.0),
+        ]
+        .map(|p| screen_vertex(p, 50.03));
+        let mut previous_contrast = None;
+        for x in [25.27_f32, 25.29, 25.31, 25.33] {
+            renderer.clear();
             renderer.rasterize(
-                [shifted(a), shifted(b), shifted(c)],
-                1.0,
-                (245, 225, 145),
-                SurfaceKind::RoadMarking,
+                [corners[0], corners[1], corners[2]],
+                0.6,
+                (87, 91, 96),
+                SurfaceKind::Road,
             );
             renderer.rasterize(
-                [shifted(a), shifted(c), shifted(d)],
-                1.0,
-                (245, 225, 145),
-                SurfaceKind::RoadMarking,
+                [corners[0], corners[2], corners[3]],
+                0.6,
+                (87, 91, 96),
+                SurfaceKind::Road,
             );
             renderer.resolve();
-            let cell = renderer.cells[12 * 50 + 25];
-            assert!(cell.ch != ' ' && cell.ch != '@', "missing at shift {shift}");
-            assert!((cell.depth - 50.0).abs() < 0.01);
+            let base = renderer.cells[CELL_INDEX].color;
+            paint_strip(&mut renderer, Vec2::new(x, 12.5), 90.0, 0.015, 50.0);
+            renderer.resolve();
+            let paint = renderer.road_marking_cell(25, 12).unwrap();
+            assert!(paint.true_coverage > 0.0 && paint.true_coverage < 0.02);
+            assert!(paint.effective_coverage > paint.true_coverage);
+            let result = renderer.cells[CELL_INDEX];
+            let contrast = result.color.0 as i32 - base.0 as i32;
+            assert!(
+                contrast >= 2 && result.ch != ' ',
+                "{x}: {:?} -> {:?}",
+                base,
+                result.color
+            );
+            if let Some(previous) = previous_contrast {
+                assert!(
+                    contrast >= previous && contrast - previous < 30,
+                    "x={x} contrast={contrast} previous={previous} true={} effective={}",
+                    paint.true_coverage,
+                    paint.effective_coverage
+                );
+            }
+            assert!((result.depth - 50.0).abs() < 0.01);
+            previous_contrast = Some(contrast);
         }
+    }
+
+    #[test]
+    fn perspective_ribbon_depth_and_nearer_foreground_occlude_paint() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let ribbon = screen_ribbon(
+            Vec2::new(25.1, 12.5),
+            Vec2::new(25.9, 12.5),
+            [0.12, 0.06],
+            [4.0, 8.0],
+        );
+        renderer.rasterize_ribbon(ribbon);
+        assert!((renderer.markings[CELL_INDEX].depth() - 5.333333).abs() < 0.01);
+        let corners = [
+            Vec2::new(25.0, 12.0),
+            Vec2::new(25.0, 13.0),
+            Vec2::new(26.0, 13.0),
+            Vec2::new(26.0, 12.0),
+        ]
+        .map(|p| screen_vertex(p, 5.0));
         renderer.rasterize(
-            [
-                Vertex {
-                    pos: Vec3::new(-1.0, -1.0, 3.0),
-                },
-                Vertex {
-                    pos: Vec3::new(1.0, -1.0, 3.0),
-                },
-                Vertex {
-                    pos: Vec3::new(0.0, 1.0, 3.0),
-                },
-            ],
+            [corners[0], corners[1], corners[2]],
+            0.8,
+            (255, 0, 0),
+            SurfaceKind::Vehicle,
+        );
+        renderer.rasterize(
+            [corners[0], corners[2], corners[3]],
             0.8,
             (255, 0, 0),
             SurfaceKind::Vehicle,
         );
         renderer.resolve();
-        let occluded = renderer.cells[12 * 50 + 25];
-        assert!(occluded.color.0 > 0 && occluded.color.1 == 0 && occluded.color.2 == 0);
-        assert!((occluded.depth - 3.0).abs() < 0.01);
+        assert_eq!(renderer.cells[CELL_INDEX].depth, 5.0);
+        assert_eq!(renderer.cells[CELL_INDEX].color.1, 0);
+    }
+
+    #[test]
+    fn perspective_width_changes_gradually_along_the_ribbon() {
+        let mut renderer = Renderer::new(50, 25, false);
+        let ribbon = screen_ribbon(
+            Vec2::new(25.5, 9.5),
+            Vec2::new(25.5, 15.5),
+            [0.7, 0.1],
+            [5.0, 60.0],
+        );
+        assert!(ribbon_visual_width(0.1, 60.0) > 0.3);
+        renderer.rasterize_ribbon(ribbon);
+        let near = renderer.markings[10 * 50 + 25];
+        let far = renderer.markings[14 * 50 + 25];
+        assert!(near.true_coverage > far.true_coverage && far.true_coverage > 0.0);
+        assert!(near.depth() < far.depth());
+        for y in 10..15 {
+            let current = renderer.markings[y * 50 + 25];
+            assert!(current.true_coverage > 0.0 && current.depth().is_finite());
+        }
+    }
+
+    #[test]
+    fn ribbon_crossing_near_plane_clips_without_screen_explosion() {
+        let mut renderer = Renderer::new(50, 25, false);
+        let camera = Camera {
+            position: Vec3::ZERO,
+            target: Vec3::Z,
+        };
+        let ribbon = RoadRibbon {
+            start: Vec3::new(0.0, 0.04, -1.0),
+            end: Vec3::new(0.0, 0.04, 5.0),
+            width: 0.18,
+            color: PAINT,
+            shade: 1.0,
+        };
+        renderer.draw_ribbons(&[ribbon], camera);
+        assert!(
+            renderer
+                .markings
+                .iter()
+                .any(|mark| mark.true_coverage > 0.0)
+        );
+        assert!(
+            renderer
+                .markings
+                .iter()
+                .all(|mark| mark.true_coverage.is_finite()
+                    && (mark.true_coverage == 0.0
+                        || (mark.depth() >= NEAR && mark.depth() <= FAR)))
+        );
+        renderer.clear();
+        let behind = RoadRibbon {
+            end: Vec3::new(0.0, 0.04, -0.01),
+            ..ribbon
+        };
+        renderer.draw_ribbons(&[behind], camera);
+        assert!(
+            renderer
+                .markings
+                .iter()
+                .all(|mark| mark.true_coverage == 0.0)
+        );
+    }
+
+    #[test]
+    fn near_wide_paint_has_no_visibility_inflation() {
+        let mut renderer = Renderer::new(50, 25, true);
+        paint_strip(&mut renderer, Vec2::new(25.5, 12.5), 90.0, 0.7, 5.0);
+        let marking = renderer.markings[CELL_INDEX];
+        let coverage = marking.true_coverage;
+        assert!(coverage > 0.5 && coverage < 0.9);
+        assert!((ribbon_visual_width(0.7, 5.0) - 0.7).abs() < 1e-6);
+        assert!(
+            (marking_visibility(
+                coverage,
+                marking.assisted_coverage,
+                marking.projected_width,
+                5.0
+            ) - coverage)
+                .abs()
+                < 1e-6
+        );
+        renderer.resolve();
+        assert!(renderer.cells[CELL_INDEX].ch != ' ');
+        assert!((renderer.cells[CELL_INDEX].depth - 5.0).abs() < 0.01);
+        let paint = renderer.road_marking_cell(25, 12).unwrap();
+        assert!((paint.projected_width - 0.7).abs() < 1e-5);
+        assert!((paint.effective_coverage - paint.true_coverage).abs() < 1e-6);
+    }
+
+    #[test]
+    fn foreshortened_paint_fades_with_distance() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let mut glyph_levels = Vec::new();
+        let mut coverages = Vec::new();
+        let mut effective_coverages = Vec::new();
+        for depth in [5.0_f32, 15.0, 40.0, 90.0, 165.0] {
+            renderer.clear();
+            // A shallow strip loses width roughly quadratically with distance.
+            let width = 0.8 * (5.0 / depth).powi(2);
+            paint_strip(&mut renderer, Vec2::new(25.5, 12.5), 0.0, width, depth);
+            coverages.push(renderer.markings[CELL_INDEX].true_coverage);
+            renderer.resolve();
+            effective_coverages.push(
+                renderer
+                    .road_marking_cell(25, 12)
+                    .unwrap()
+                    .effective_coverage,
+            );
+            glyph_levels.push(
+                PALETTE
+                    .iter()
+                    .position(|&ch| ch as char == renderer.cells[CELL_INDEX].ch)
+                    .unwrap(),
+            );
+        }
+        assert!(
+            coverages.windows(2).all(|pair| pair[0] > pair[1]),
+            "{coverages:?}"
+        );
+        assert!(
+            glyph_levels.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{glyph_levels:?}"
+        );
+        assert!(
+            effective_coverages.windows(2).all(|pair| pair[0] > pair[1]),
+            "{effective_coverages:?}"
+        );
+        assert!(
+            effective_coverages[0] > 0.5
+                && effective_coverages[3] > 0.001
+                && effective_coverages[4] < 0.001
+        );
+        assert!(
+            glyph_levels[0] > glyph_levels[2] && glyph_levels[4] == 0,
+            "{glyph_levels:?}"
+        );
+    }
+    #[test]
+    fn road_backed_marking_fades_without_a_score_cutoff() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let mut contrasts = Vec::new();
+        for depth in [5.0_f32, 15.0, 40.0, 90.0, 120.0, 165.0] {
+            renderer.clear();
+            let corners = [
+                Vec2::new(25.0, 12.0),
+                Vec2::new(25.0, 13.0),
+                Vec2::new(26.0, 13.0),
+                Vec2::new(26.0, 12.0),
+            ]
+            .map(|p| screen_vertex(p, depth + 0.03));
+            renderer.rasterize(
+                [corners[0], corners[1], corners[2]],
+                0.6,
+                (87, 91, 96),
+                SurfaceKind::Road,
+            );
+            renderer.rasterize(
+                [corners[0], corners[2], corners[3]],
+                0.6,
+                (87, 91, 96),
+                SurfaceKind::Road,
+            );
+            renderer.resolve();
+            let base = renderer.cells[CELL_INDEX].color;
+            paint_strip(
+                &mut renderer,
+                Vec2::new(25.5, 12.5),
+                0.0,
+                0.8 * (5.0 / depth).powi(2),
+                depth,
+            );
+            renderer.resolve();
+            let cell = renderer.cells[CELL_INDEX];
+            assert_ne!(cell.ch, ' ', "missing road background at {depth}");
+            let difference = |a: u8, b: u8| (a as i16 - b as i16).abs();
+            contrasts.push(
+                difference(cell.color.0, base.0)
+                    + difference(cell.color.1, base.1)
+                    + difference(cell.color.2, base.2),
+            );
+        }
+        assert!(
+            contrasts.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{contrasts:?}"
+        );
+        assert!(
+            contrasts[0] > contrasts[2]
+                && contrasts[2] > contrasts[3]
+                && contrasts[3] > contrasts[4]
+                && contrasts[4] > contrasts[5],
+            "{contrasts:?}"
+        );
     }
 }

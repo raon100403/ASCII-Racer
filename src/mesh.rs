@@ -18,6 +18,15 @@ impl SurfaceKind {
 }
 
 #[derive(Clone, Copy)]
+pub struct RoadRibbon {
+    pub start: Vec3,
+    pub end: Vec3,
+    pub width: f32,
+    pub color: (u8, u8, u8),
+    pub shade: f32,
+}
+
+#[derive(Clone, Copy)]
 pub struct Triangle {
     pub vertices: [Vec3; 3],
     pub color: (u8, u8, u8),

@@ -70,6 +70,7 @@ impl WebGame {
 
         self.renderer.clear();
         self.renderer.draw_mesh(&self.track.mesh, self.camera);
+        self.renderer.draw_ribbons(&self.track.ribbons, self.camera);
         self.renderer.draw_mesh(&self.car.mesh(), self.camera);
         self.draw_hud(offroad);
         self.renderer.write_packed_cells(&mut self.packed_cells);

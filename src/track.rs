@@ -1,4 +1,4 @@
-use crate::mesh::{Mesh, SurfaceKind};
+use crate::mesh::{Mesh, RoadRibbon, SurfaceKind};
 use glam::{Mat4, Vec2, Vec3};
 
 pub const ROAD_HALF_WIDTH: f32 = 6.2;
@@ -9,6 +9,7 @@ const RAIL_SEGMENTS: &[usize] = &[1, 2, 5, 6, 7];
 pub struct Track {
     points: Vec<Vec2>,
     pub mesh: Mesh,
+    pub ribbons: Vec<RoadRibbon>,
     next_checkpoint: usize,
     checkpoint_armed: bool,
     pub laps: u32,
@@ -30,10 +31,12 @@ impl Track {
             Vec2::new(20.0, -8.0),
             Vec2::new(5.0, -14.0),
         ];
-        let mesh = build_mesh(&points);
+        let mut ribbons = Vec::new();
+        let mesh = build_mesh(&points, &mut ribbons);
         Self {
             points,
             mesh,
+            ribbons,
             next_checkpoint: 0,
             checkpoint_armed: true,
             laps: 0,
@@ -121,7 +124,7 @@ fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> (f32, Vec2) {
     (p.distance(nearest), nearest)
 }
 
-fn build_mesh(points: &[Vec2]) -> Mesh {
+fn build_mesh(points: &[Vec2], ribbons: &mut Vec<RoadRibbon>) -> Mesh {
     let mut mesh = Mesh::new();
     let grass = (40, 102, 46);
     let a = Vec3::new(-210.0, -0.08, -210.0);
@@ -158,46 +161,27 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             0.62,
             SurfaceKind::Road,
         );
-        strip(
-            &mut mesh,
-            a,
-            b,
-            right,
-            -ROAD_HALF_WIDTH,
-            -ROAD_HALF_WIDTH + 0.18,
-            0.04,
-            (245, 225, 145),
-            1.0,
-            SurfaceKind::RoadMarking,
-        );
-        strip(
-            &mut mesh,
-            a,
-            b,
-            right,
-            ROAD_HALF_WIDTH - 0.18,
-            ROAD_HALF_WIDTH,
-            0.04,
-            (245, 225, 145),
-            1.0,
-            SurfaceKind::RoadMarking,
-        );
+        for side in [-1.0, 1.0] {
+            let offset = right * side * (ROAD_HALF_WIDTH - 0.09);
+            ribbons.push(RoadRibbon {
+                start: Vec3::new(a.x + offset.x, 0.04, a.y + offset.y),
+                end: Vec3::new(b.x + offset.x, 0.04, b.y + offset.y),
+                width: 0.18,
+                color: (245, 225, 145),
+                shade: 1.0,
+            });
+        }
         let mut distance = 4.0;
         let length = a.distance(b);
         while distance + 2.0 < length {
             let start = a + dir * distance;
-            strip(
-                &mut mesh,
-                start,
-                start + dir * 2.1,
-                right,
-                -0.08,
-                0.08,
-                0.048,
-                (225, 216, 176),
-                0.95,
-                SurfaceKind::RoadMarking,
-            );
+            ribbons.push(RoadRibbon {
+                start: Vec3::new(start.x, 0.048, start.y),
+                end: Vec3::new(start.x + dir.x * 2.1, 0.048, start.y + dir.y * 2.1),
+                width: 0.16,
+                color: (225, 216, 176),
+                shade: 0.95,
+            });
             distance += 8.0;
         }
         if RAIL_SEGMENTS.contains(&i) {
@@ -236,7 +220,7 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
             );
         }
     }
-    // Bridge the outer edge of each bend with the same circular profile as the road join.
+    // Bridge straight edge ribbon endpoints with arcs at the same center radius.
     for i in 0..points.len() {
         let point = points[i];
         let incoming = (point - points[(i + points.len() - 1) % points.len()]).normalize();
@@ -245,38 +229,38 @@ fn build_mesh(points: &[Vec2]) -> Mesh {
         if turn.abs() < 0.001 {
             continue;
         }
-        let side = turn.signum();
-        let start = Vec2::new(incoming.y, -incoming.x) * side;
-        let end = Vec2::new(outgoing.y, -outgoing.x) * side;
-        let angle = start.perp_dot(end).atan2(start.dot(end));
-        let steps = ((angle.abs() * 8.0).ceil() as usize).max(1);
-        for step in 0..steps {
-            let dir = |t: f32| {
-                let a = angle * t;
-                Vec2::new(
-                    start.x * a.cos() - start.y * a.sin(),
-                    start.x * a.sin() + start.y * a.cos(),
-                )
-            };
-            let at = |direction: Vec2, radius: f32| {
-                Vec3::new(
-                    point.x + direction.x * radius,
-                    0.045,
-                    point.y + direction.y * radius,
-                )
-            };
-            let u = dir(step as f32 / steps as f32);
-            let v = dir((step + 1) as f32 / steps as f32);
-            let inner_a = at(u, ROAD_HALF_WIDTH - 0.18);
-            let outer_a = at(u, ROAD_HALF_WIDTH);
-            let inner_b = at(v, ROAD_HALF_WIDTH - 0.18);
-            let outer_b = at(v, ROAD_HALF_WIDTH);
-            let (a, b, c, d) = if turn > 0.0 {
-                (inner_a, inner_b, outer_b, outer_a)
-            } else {
-                (outer_a, outer_b, inner_b, inner_a)
-            };
-            mesh.quad_kind(a, b, c, d, (245, 225, 145), 1.0, SurfaceKind::RoadMarking);
+        for side in [-1.0, 1.0] {
+            let start = Vec2::new(incoming.y, -incoming.x) * side;
+            let end = Vec2::new(outgoing.y, -outgoing.x) * side;
+            let angle = start.perp_dot(end).atan2(start.dot(end));
+            let steps = ((angle.abs() * 8.0).ceil() as usize).max(1);
+            for step in 0..steps {
+                let dir = |t: f32| {
+                    let a = angle * t;
+                    Vec2::new(
+                        start.x * a.cos() - start.y * a.sin(),
+                        start.x * a.sin() + start.y * a.cos(),
+                    )
+                };
+                let at = |direction: Vec2, radius: f32| {
+                    Vec3::new(
+                        point.x + direction.x * radius,
+                        0.04,
+                        point.y + direction.y * radius,
+                    )
+                };
+                let u = dir(step as f32 / steps as f32);
+                let v = dir((step + 1) as f32 / steps as f32);
+                let start = at(u, ROAD_HALF_WIDTH - 0.09);
+                let end = at(v, ROAD_HALF_WIDTH - 0.09);
+                ribbons.push(RoadRibbon {
+                    start,
+                    end,
+                    width: 0.18,
+                    color: (245, 225, 145),
+                    shade: 1.0,
+                });
+            }
         }
     }
     for &index in CHECKPOINTS {
@@ -353,45 +337,103 @@ mod tests {
     }
 
     #[test]
-    fn outer_corner_markings_face_up_and_meet_straight_edges() {
+    fn corner_ribbons_connect_straight_edges() {
         let track = Track::new();
-        let joints: Vec<_> = track
-            .mesh
-            .triangles
-            .iter()
-            .filter(|t| {
-                t.surface == SurfaceKind::RoadMarking
-                    && t.vertices.iter().all(|v| (v.y - 0.045).abs() < 0.0001)
-            })
-            .collect();
-        assert!(!joints.is_empty());
-        for t in &joints {
-            let normal = (t.vertices[1] - t.vertices[0])
-                .cross(t.vertices[2] - t.vertices[0])
-                .y;
-            assert!(
-                normal > 0.0,
-                "inverted corner marking: {normal}, {:?}",
-                t.vertices
-            );
-        }
+        assert!(
+            track
+                .mesh
+                .triangles
+                .iter()
+                .all(|triangle| triangle.surface != SurfaceKind::RoadMarking)
+        );
+        let center_radius = ROAD_HALF_WIDTH - 0.09;
         for i in 0..track.points.len() {
             let point = track.points[i];
-            let prev = (point - track.points[(i + track.points.len() - 1) % track.points.len()])
-                .normalize();
-            let next = (track.points[(i + 1) % track.points.len()] - point).normalize();
-            let side = prev.perp_dot(next).signum();
-            for direction in [prev, next] {
-                let right = Vec2::new(direction.y, -direction.x) * side;
-                let tip = point + right * ROAD_HALF_WIDTH;
+            let incoming = (point
+                - track.points[(i + track.points.len() - 1) % track.points.len()])
+            .normalize();
+            let outgoing = (track.points[(i + 1) % track.points.len()] - point).normalize();
+            for side in [-1.0, 1.0] {
+                let tip = |direction: Vec2| {
+                    point + Vec2::new(direction.y, -direction.x) * side * center_radius
+                };
+                let from = tip(incoming);
+                let to = tip(outgoing);
+                let start = Vec3::new(from.x, 0.04, from.y);
+                let end = Vec3::new(to.x, 0.04, to.y);
+                let angle = incoming.perp_dot(outgoing).atan2(incoming.dot(outgoing));
+                let steps = ((angle.abs() * 8.0).ceil() as usize).max(1);
+                let first = track.ribbons.iter().position(|r| {
+                    r.start.distance(start) < 0.001 && (r.start.y - 0.04).abs() < 0.0001
+                });
+                let first =
+                    first.unwrap_or_else(|| panic!("missing corner ribbon at {i}, side {side}"));
+                let arc = track
+                    .ribbons
+                    .get(first..first + steps)
+                    .expect("incomplete corner ribbon");
                 assert!(
-                    joints.iter().any(|t| t
-                        .vertices
+                    arc.last().unwrap().end.distance(end) < 0.001,
+                    "outgoing edge does not meet corner {i}, side {side}"
+                );
+                for r in arc {
+                    assert!((r.start.y - 0.04).abs() < 0.0001);
+                    assert!((r.width - 0.18).abs() < 0.0001);
+                    assert!(
+                        ((Vec2::new(r.start.x, r.start.z) - point).length() - center_radius).abs()
+                            < 0.001
+                    );
+                }
+                for pair in arc.windows(2) {
+                    assert!(
+                        pair[0].end.distance(pair[1].start) < 0.001,
+                        "disconnected corner at {i}, side {side}"
+                    );
+                }
+                assert!(
+                    track.ribbons.iter().any(|r| {
+                        r.end.distance(start) < 0.001 && r.start.distance(start) > 0.3
+                    })
+                );
+                assert!(
+                    track
+                        .ribbons
                         .iter()
-                        .any(|v| { (Vec2::new(v.x, v.z) - tip).length() < 0.001 })),
-                    "missing marking join at corner {i}"
+                        .any(|r| { r.start.distance(end) < 0.001 && r.end.distance(end) > 0.3 })
                 );
             }
+        }
+    }
+
+    #[test]
+    fn center_dashes_follow_two_point_one_length_and_eight_unit_step() {
+        let track = Track::new();
+        for (a, b, _) in track.segments() {
+            let dir = (b - a).normalize();
+            let length = a.distance(b);
+            let dashes: Vec<_> = track
+                .ribbons
+                .iter()
+                .filter(|r| {
+                    if (r.start.y - 0.048).abs() > 0.0001 {
+                        return false;
+                    }
+                    let relative = Vec2::new(r.start.x, r.start.z) - a;
+                    relative.perp_dot(dir).abs() < 0.001
+                        && relative.dot(dir) >= 3.999
+                        && relative.dot(dir) < length - 2.0 + 0.001
+                })
+                .collect();
+            let mut expected = 4.0;
+            for dash in &dashes {
+                let start = Vec2::new(dash.start.x, dash.start.z);
+                let end = Vec2::new(dash.end.x, dash.end.z);
+                assert!(start.distance(a + dir * expected) < 0.001);
+                assert!(end.distance(start + dir * 2.1) < 0.001);
+                assert!((dash.width - 0.16).abs() < 0.0001);
+                expected += 8.0;
+            }
+            assert!(expected + 2.0 >= length);
         }
     }
 }
