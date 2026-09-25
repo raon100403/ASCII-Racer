@@ -1,6 +1,7 @@
 mod glyph;
 
 pub mod car;
+pub mod chase_camera;
 pub mod mesh;
 pub mod renderer;
 pub mod track;

@@ -5,10 +5,10 @@
 
 use crate::{
     car::Car,
-    renderer::{Camera, GlyphMode, Renderer},
+    chase_camera::ChaseCamera,
+    renderer::{GlyphMode, Renderer},
     track::{ROAD_HALF_WIDTH, Track},
 };
-use glam::Vec3;
 use std::cell::RefCell;
 
 const TOTAL_LAPS: u32 = 3;
@@ -26,7 +26,7 @@ struct WebGame {
     renderer: Renderer,
     car: Car,
     track: Track,
-    camera: Camera,
+    camera: ChaseCamera,
     input: u32,
     elapsed: f32,
     packed_cells: Vec<u32>,
@@ -34,14 +34,13 @@ struct WebGame {
 
 impl WebGame {
     fn new(width: usize, height: usize) -> Self {
+        let car = Car::new();
+        let camera = ChaseCamera::new(&car);
         Self {
             renderer: Renderer::new(width.max(1), height.max(1), true),
-            car: Car::new(),
+            car,
             track: Track::new(),
-            camera: Camera {
-                position: Vec3::new(0.0, 3.7, -6.3),
-                target: Vec3::new(0.0, 0.8, 3.0),
-            },
+            camera,
             input: 0,
             elapsed: 0.0,
             packed_cells: Vec::with_capacity(width * height),
@@ -61,17 +60,13 @@ impl WebGame {
             .collide(&mut self.car.position, &mut self.car.velocity);
         self.track.update_checkpoint(self.car.position);
 
-        let forward = self.car.forward();
-        let desired = self.car.position - forward * 6.3 + Vec3::Y * 3.7;
-        let target = self.car.position + forward * 3.0 + Vec3::Y * 0.8;
-        let smoothing = 1.0 - (-5.0 * dt).exp();
-        self.camera.position = self.camera.position.lerp(desired, smoothing);
-        self.camera.target = self.camera.target.lerp(target, smoothing);
+        self.camera.update(&self.car, dt);
+        let camera = self.camera.camera();
 
         self.renderer.clear();
-        self.renderer.draw_mesh(&self.track.mesh, self.camera);
-        self.renderer.draw_ribbons(&self.track.ribbons, self.camera);
-        self.renderer.draw_mesh(&self.car.mesh(), self.camera);
+        self.renderer.draw_mesh(&self.track.mesh, camera);
+        self.renderer.draw_ribbons(&self.track.ribbons, camera);
+        self.renderer.draw_mesh(&self.car.mesh(), camera);
         self.draw_hud(offroad);
         self.renderer.write_packed_cells(&mut self.packed_cells);
     }
@@ -112,6 +107,7 @@ impl WebGame {
 
     fn reset(&mut self) {
         self.car.reset();
+        self.camera = ChaseCamera::new(&self.car);
         self.track.reset_progress();
         self.elapsed = 0.0;
         self.renderer.reset_glyph_history();

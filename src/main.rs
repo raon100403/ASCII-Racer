@@ -3,6 +3,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 use ascii_racer::{
     car::Car,
+    chase_camera::ChaseCamera,
     mesh::Mesh,
     renderer::{AaMode, Camera, DebugView, GlyphMode, Renderer},
     track::{ROAD_HALF_WIDTH, Track},
@@ -187,10 +188,7 @@ fn main() -> io::Result<()> {
     let mut inputs = Inputs::default();
     let mut car = Car::new();
     let mut track = Track::new();
-    let mut camera = Camera {
-        position: Vec3::new(0.0, 3.7, -6.3),
-        target: Vec3::new(0.0, 0.8, 3.0),
-    };
+    let mut chase_camera = ChaseCamera::new(&car);
     let cube = Mesh::box_mesh(Vec3::splat(2.0), (255, 190, 80));
     let start = Instant::now();
     let mut last = start;
@@ -230,6 +228,7 @@ fn main() -> io::Result<()> {
                 car.reset();
                 track.reset_progress();
                 renderer.reset_glyph_history();
+                chase_camera = ChaseCamera::new(&car);
                 inputs.reset = false;
             }
             let offroad = track.road_distance(car.position) > ROAD_HALF_WIDTH;
@@ -242,12 +241,8 @@ fn main() -> io::Result<()> {
             );
             track.collide(&mut car.position, &mut car.velocity);
             track.update_checkpoint(car.position);
-            let forward = car.forward();
-            let desired = car.position - forward * 6.3 + Vec3::Y * 3.7;
-            let target = car.position + forward * 3.0 + Vec3::Y * 0.8;
-            let smoothing = 1.0 - (-5.0 * dt).exp();
-            camera.position = camera.position.lerp(desired, smoothing);
-            camera.target = camera.target.lerp(target, smoothing);
+            chase_camera.update(&car, dt);
+            let camera = chase_camera.camera();
             renderer.draw_mesh(&track.mesh, camera);
             renderer.draw_ribbons(&track.ribbons, camera);
             renderer.draw_mesh(&car.mesh(), camera);
