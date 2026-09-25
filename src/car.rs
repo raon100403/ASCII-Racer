@@ -27,7 +27,7 @@ const DRIVING: DrivingTuning = DrivingTuning {
     handbrake_drag: 1.1,
     offroad_drag: 2.8,
     offroad_speed: 13.0,
-    steering_rate: 1.65,
+    steering_rate: 1.3,
     handbrake_steering_rate: 2.2,
     high_speed_steer_start: 0.55,
     high_speed_steer_reduction: 0.10,
