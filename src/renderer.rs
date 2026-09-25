@@ -1,3 +1,5 @@
+pub use crate::glyph::GlyphMode;
+use crate::glyph::{CellRole, GlyphInput, choose};
 use crate::mesh::{Mesh, RoadRibbon, SurfaceKind};
 use glam::{Vec2, Vec3};
 use std::fmt::Write as _;
@@ -258,6 +260,185 @@ fn debug_marking(strength: f32, depth: f32) -> Cell {
     }
 }
 
+// A directional 2x2 mask is only a stroke when nearby visible coverage stays
+// on that same one-cell-wide axis. Area beside the axis identifies a filled
+// silhouette, including slanted faces without any fully covered cell.
+fn mesh_cell_role(
+    all_samples: &[Sample],
+    width: usize,
+    index: usize,
+    count: usize,
+    sample: Sample,
+    coverage: f32,
+) -> CellRole {
+    if count == 1 || coverage >= 0.72 {
+        return CellRole::Filled;
+    }
+    let center = &all_samples[index * count..(index + 1) * count];
+    let mask = center.iter().enumerate().fold(0u8, |mask, (i, s)| {
+        if s.surface == sample.surface
+            && s.color == sample.color
+            && s.depth.is_finite()
+            && s.depth <= sample.depth * 1.08
+            && sample.depth <= s.depth * 1.08
+            && s.coverage > 0.5
+        {
+            mask | (1 << i)
+        } else {
+            mask
+        }
+    });
+    let axis = match mask {
+        0b0011 | 0b1100 => 0,
+        0b0101 | 0b1010 => 1,
+        0b1001 => 2,
+        0b0110 => 3,
+        _ => return CellRole::SilhouetteBoundary,
+    };
+    let x = index % width;
+    let y = index / width;
+    let height = all_samples.len() / count / width;
+    let mut axis_mass = 0.0;
+    let mut cross_axis_mass = 0.0;
+    for dy in -1isize..=1 {
+        for dx in -1isize..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let nx = x as isize + dx;
+            let ny = y as isize + dy;
+            if nx < 0 || nx >= width as isize || ny < 0 || ny >= height as isize {
+                continue;
+            }
+            let cell = (ny as usize * width + nx as usize) * count;
+            let neighbors = &all_samples[cell..cell + count];
+            let nearest = neighbors.iter().fold(f32::INFINITY, |z, s| z.min(s.depth));
+            let mass = neighbors
+                .iter()
+                .filter(|s| {
+                    s.surface == sample.surface
+                        && s.depth.is_finite()
+                        && s.depth <= nearest * 1.08
+                        && s.depth <= sample.depth * 1.08
+                        && sample.depth <= s.depth * 1.08
+                })
+                .map(|s| s.coverage)
+                .sum::<f32>()
+                / count as f32;
+            let on_axis = match axis {
+                0 => dy == 0,
+                1 => dx == 0,
+                2 => dx == dy,
+                _ => dx == -dy,
+            };
+            if on_axis {
+                axis_mass += mass;
+            } else {
+                cross_axis_mass += mass;
+            }
+        }
+    }
+    if cross_axis_mass >= 0.35 && (cross_axis_mass >= axis_mass * 0.2 || cross_axis_mass >= 0.75) {
+        CellRole::SilhouetteBoundary
+    } else {
+        CellRole::ThinStructure
+    }
+}
+
+fn shape_cell(
+    mode: GlyphMode,
+    history: &mut GlyphHistory,
+    samples: &[Sample],
+    marking: &MarkingCoverage,
+    resolved: (Sample, f32, CellRole),
+    shaded: (f32, (u8, u8, u8)),
+    road_blend: bool,
+) -> Cell {
+    let (sample, coverage, role) = resolved;
+    let (intensity, mut color) = shaded;
+    if mode == GlyphMode::Density {
+        return resolved_cell(intensity, sample.depth, color);
+    }
+    let paint = sample.surface == SurfaceKind::RoadMarking;
+    if paint && !road_blend {
+        // Without asphalt beneath it, coverage must fade RGB as well as ink.
+        let strength = (intensity / 0.24).clamp(0.0, 1.0);
+        color = (
+            (color.0 as f32 * strength).round() as u8,
+            (color.1 as f32 * strength).round() as u8,
+            (color.2 as f32 * strength).round() as u8,
+        );
+    }
+    if !paint || road_blend {
+        // Broad distant surfaces retain their ink; RGB, not punctuation,
+        // carries their distance/contrast falloff.
+        let fade = 1.0 - 0.48 * smoothstep(45.0, FAR, sample.depth);
+        color = (
+            (color.0 as f32 * fade).round() as u8,
+            (color.1 as f32 * fade).round() as u8,
+            (color.2 as f32 * fade).round() as u8,
+        );
+    }
+    let mut next = GlyphHistory {
+        ch: ' ',
+        depth: sample.depth,
+        color,
+        brightness: sample.brightness,
+        coverage,
+        surface: sample.surface,
+    };
+    let shape = if paint {
+        [0.0; 4]
+    } else if matches!(sample.surface, SurfaceKind::Road | SurfaceKind::Ground)
+        || samples.len() == 1
+    {
+        [coverage; 4]
+    } else {
+        std::array::from_fn(|i| {
+            let s = samples[i];
+            if s.surface == sample.surface
+                && s.color == sample.color
+                && s.depth.is_finite()
+                && s.depth <= sample.depth * 1.08
+                && sample.depth <= s.depth * 1.08
+            {
+                s.coverage
+            } else {
+                0.0
+            }
+        })
+    };
+    let previous = history.compatible(next).then_some(history.ch);
+    next.ch = choose(
+        GlyphInput {
+            surface: sample.surface,
+            coverage,
+            true_coverage: if paint {
+                marking.true_coverage
+            } else {
+                coverage
+            },
+            projected_width: if paint { marking.projected_width } else { 0.0 },
+            intensity,
+            shape,
+            direction: if paint {
+                marking.direction.normalize_or_zero()
+            } else {
+                Vec2::ZERO
+            },
+            center_y: if paint { marking.center.y } else { 0.5 },
+            role,
+        },
+        previous,
+    );
+    *history = next;
+    Cell {
+        ch: next.ch,
+        depth: sample.depth,
+        color,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AaMode {
     Off,
@@ -318,6 +499,49 @@ impl Default for Cell {
 }
 
 #[derive(Clone, Copy)]
+struct GlyphHistory {
+    ch: char,
+    depth: f32,
+    color: (u8, u8, u8),
+    brightness: f32,
+    coverage: f32,
+    surface: SurfaceKind,
+}
+
+impl Default for GlyphHistory {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            depth: f32::INFINITY,
+            color: (0, 0, 0),
+            brightness: 0.0,
+            coverage: 0.0,
+            surface: SurfaceKind::Generic,
+        }
+    }
+}
+
+impl GlyphHistory {
+    fn compatible(self, next: Self) -> bool {
+        self.ch != ' '
+            && self.surface == next.surface
+            && self.depth.is_finite()
+            && (self.depth - next.depth).abs() <= next.depth * 0.08
+            && (self.brightness - next.brightness).abs() < 0.24
+            && (self.coverage - next.coverage).abs() < (next.coverage * 0.5).max(0.15)
+            && [
+                self.color.0.abs_diff(next.color.0),
+                self.color.1.abs_diff(next.color.1),
+                self.color.2.abs_diff(next.color.2),
+            ]
+            .into_iter()
+            .max()
+            .unwrap()
+                < 60
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Vertex {
     pos: Vec3,
 }
@@ -343,6 +567,10 @@ pub struct Renderer {
     cells: Vec<Cell>,
     samples: Vec<Sample>,
     markings: Vec<MarkingCoverage>,
+    glyph_history: Vec<GlyphHistory>,
+    glyph_mode: GlyphMode,
+    last_camera: Option<Camera>,
+    frame_camera_seen: bool,
     color: bool,
     cell_aspect: f32,
     aa: AaMode,
@@ -368,6 +596,10 @@ impl Renderer {
             cells: vec![Cell::default(); width * height],
             samples: vec![Sample::default(); width * height * aa.count()],
             markings: vec![MarkingCoverage::default(); width * height],
+            glyph_history: vec![GlyphHistory::default(); width * height],
+            glyph_mode: GlyphMode::Shape,
+            last_camera: None,
+            frame_camera_seen: false,
             color,
             cell_aspect,
             aa,
@@ -383,17 +615,49 @@ impl Renderer {
             .resize(width * height * self.aa.count(), Sample::default());
         self.markings
             .resize(width * height, MarkingCoverage::default());
+        self.glyph_history
+            .resize(width * height, GlyphHistory::default());
         self.clear();
+        self.reset_glyph_history();
     }
 
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.samples.fill(Sample::default());
         self.markings.fill(MarkingCoverage::default());
+        self.frame_camera_seen = false;
     }
 
     pub fn set_debug_view(&mut self, view: DebugView) {
         self.debug_view = view;
+    }
+
+    pub fn set_glyph_mode(&mut self, mode: GlyphMode) {
+        if self.glyph_mode != mode {
+            self.glyph_mode = mode;
+            self.reset_glyph_history();
+        }
+    }
+
+    pub fn reset_glyph_history(&mut self) {
+        self.glyph_history.fill(GlyphHistory::default());
+        self.last_camera = None;
+    }
+
+    fn observe_camera(&mut self, camera: Camera) {
+        if !self.frame_camera_seen {
+            if self.last_camera.is_some_and(|previous| {
+                previous.position.distance_squared(camera.position) > 9.0
+                    || (previous.target - previous.position)
+                        .normalize_or_zero()
+                        .dot((camera.target - camera.position).normalize_or_zero())
+                        < 0.85
+            }) {
+                self.reset_glyph_history();
+            }
+            self.last_camera = Some(camera);
+            self.frame_camera_seen = true;
+        }
     }
 
     /// Paint data after the last normal or effective-coverage resolve.
@@ -435,6 +699,7 @@ impl Renderer {
     }
 
     pub fn draw_mesh(&mut self, mesh: &Mesh, camera: Camera) {
+        self.observe_camera(camera);
         let forward = (camera.target - camera.position).normalize_or_zero();
         let right = Vec3::Y.cross(forward).normalize_or_zero();
         let up = forward.cross(right);
@@ -480,6 +745,7 @@ impl Renderer {
         if self.width == 0 || self.height == 0 {
             return;
         }
+        self.observe_camera(camera);
         let forward = (camera.target - camera.position).normalize_or_zero();
         let right = Vec3::Y.cross(forward).normalize_or_zero();
         let up = forward.cross(right);
@@ -703,11 +969,14 @@ impl Renderer {
 
     fn resolve(&mut self) {
         let count = self.aa.count();
-        for ((cell, samples), marking) in self
+        let all_samples = &self.samples;
+        for (index, (((cell, samples), marking), history)) in self
             .cells
             .iter_mut()
-            .zip(self.samples.chunks_exact(count))
+            .zip(all_samples.chunks_exact(count))
             .zip(&mut self.markings)
+            .zip(&mut self.glyph_history)
+            .enumerate()
         {
             marking.effective_coverage = 0.0;
             if cell.depth < 0.0 {
@@ -862,19 +1131,42 @@ impl Renderer {
                 let mix = |base: u8, paint: u8| {
                     (base as f32 + (paint as f32 - base as f32) * opacity).round() as u8
                 };
-                *cell = resolved_cell(
-                    intensity,
-                    marking_depth,
-                    (
-                        mix(road_color.0, paint_color.0),
-                        mix(road_color.1, paint_color.1),
-                        mix(road_color.2, paint_color.2),
-                    ),
+                let color = (
+                    mix(road_color.0, paint_color.0),
+                    mix(road_color.1, paint_color.1),
+                    mix(road_color.2, paint_color.2),
+                );
+                *cell = shape_cell(
+                    self.glyph_mode,
+                    history,
+                    samples,
+                    marking,
+                    (paint, effective, CellRole::Filled),
+                    (intensity, color),
+                    true,
                 );
             } else if let Some((sample, coverage)) = winner {
                 let (intensity, color) = shade(sample, coverage);
-                *cell = resolved_cell(intensity, sample.depth, color);
+                let role = if self.glyph_mode == GlyphMode::Shape
+                    && !matches!(
+                        sample.surface,
+                        SurfaceKind::Road | SurfaceKind::Ground | SurfaceKind::RoadMarking
+                    ) {
+                    mesh_cell_role(all_samples, self.width, index, count, sample, coverage)
+                } else {
+                    CellRole::Filled
+                };
+                *cell = shape_cell(
+                    self.glyph_mode,
+                    history,
+                    samples,
+                    marking,
+                    (sample, coverage, role),
+                    (intensity, color),
+                    false,
+                );
             } else {
+                *history = GlyphHistory::default();
                 *cell = Cell::default();
             }
         }
@@ -1087,6 +1379,221 @@ mod tests {
     }
 
     #[test]
+    fn real_car_top_is_filled_not_an_ascii_cap() {
+        let mut renderer = Renderer::new(109, 33, true);
+        let car = Car::new();
+        let camera = Camera {
+            position: Vec3::new(0.0, 3.7, -6.3),
+            target: Vec3::new(0.0, 0.8, 3.0),
+        };
+        renderer.draw_mesh(&car.mesh(), camera);
+        renderer.resolve();
+        let red_body = |index: usize| {
+            let color = renderer.cells[index].color;
+            renderer.glyph_history[index].surface == SurfaceKind::Vehicle
+                && (color.0 as u16) > (color.1 as u16) * 2
+                && (color.0 as u16) > (color.2 as u16) * 2
+        };
+        let top = (0..renderer.cells.len())
+            .filter(|&index| red_body(index))
+            .map(|index| index / renderer.width)
+            .min()
+            .unwrap();
+        let cap: String = (top * renderer.width..(top + 1) * renderer.width)
+            .filter(|&index| red_body(index))
+            .map(|index| renderer.cells[index].ch)
+            .collect();
+        assert!(cap.len() >= 3, "too few car roof cells: {cap}");
+        assert!(cap.chars().all(|ch| "=+*#%@".contains(ch)), "roof: {cap}");
+        assert!(
+            renderer
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| red_body(*index))
+                .all(|(_, cell)| !"()[]".contains(cell.ch))
+        );
+    }
+
+    #[test]
+    fn neighbor_fill_disambiguates_a_thin_generic_stroke_from_a_solid_corner() {
+        let mut renderer = Renderer::new(50, 25, true);
+        for (occupied, line) in [
+            ([false, true, true, false], '/'),
+            ([true, false, false, true], '\\'),
+        ] {
+            renderer.clear();
+            let part = Sample {
+                depth: 5.0,
+                color: (200, 140, 90),
+                brightness: 0.6,
+                coverage: 1.0,
+                surface: SurfaceKind::Generic,
+            };
+            for (s, active) in renderer.samples[CELL_INDEX * 4..CELL_INDEX * 4 + 4]
+                .iter_mut()
+                .zip(occupied)
+            {
+                if active {
+                    *s = part;
+                }
+            }
+            renderer.resolve();
+            assert_eq!(renderer.cells[CELL_INDEX].ch, line);
+
+            // Same partial mask, but a full cell immediately beneath it now
+            // proves this is the AA edge of a filled face, not a diagonal line.
+            renderer.samples[(CELL_INDEX + 50) * 4..(CELL_INDEX + 51) * 4].fill(part);
+            renderer.resolve();
+            assert!("=+*#%@".contains(renderer.cells[CELL_INDEX].ch));
+            assert_ne!(
+                renderer.cells[CELL_INDEX].ch, line,
+                "history kept a stroke on a solid"
+            );
+        }
+    }
+
+    fn put_mesh_mask(
+        renderer: &mut Renderer,
+        x: usize,
+        y: usize,
+        surface: SurfaceKind,
+        mask: [bool; 4],
+    ) {
+        let start = (y * renderer.width + x) * 4;
+        for (slot, active) in renderer.samples[start..start + 4].iter_mut().zip(mask) {
+            if active {
+                *slot = Sample {
+                    depth: 5.0,
+                    color: (210, 160, 100),
+                    brightness: 0.65,
+                    coverage: 1.0,
+                    surface,
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn three_sample_diagonal_boundary_uses_fill_ink() {
+        for surface in [
+            SurfaceKind::Vehicle,
+            SurfaceKind::Guardrail,
+            SurfaceKind::Generic,
+            SurfaceKind::Checkpoint,
+        ] {
+            let mut renderer = Renderer::new(50, 25, false);
+            put_mesh_mask(&mut renderer, 25, 12, surface, [false, true, true, true]);
+            renderer.resolve();
+            assert!(
+                "=+*#%@".contains(renderer.cells[CELL_INDEX].ch),
+                "{surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slanted_broad_strip_without_full_cells_is_a_silhouette_for_every_mesh_kind() {
+        for surface in [
+            SurfaceKind::Vehicle,
+            SurfaceKind::Guardrail,
+            SurfaceKind::Generic,
+            SurfaceKind::Checkpoint,
+        ] {
+            let mut renderer = Renderer::new(50, 25, false);
+            // Two parallel diagonal runs reproduce the guardrail edge: every
+            // occupied cell has only two samples, including all neighbors.
+            for step in -2isize..=2 {
+                let x = (25 + step) as usize;
+                let y = (12 - step) as usize;
+                put_mesh_mask(&mut renderer, x, y, surface, [false, true, true, false]);
+                put_mesh_mask(&mut renderer, x + 1, y, surface, [false, true, true, false]);
+            }
+            let part = renderer.samples[CELL_INDEX * 4 + 1];
+            assert_eq!(
+                mesh_cell_role(&renderer.samples, 50, CELL_INDEX, 4, part, 0.5),
+                CellRole::SilhouetteBoundary,
+                "{surface:?}"
+            );
+            renderer.resolve();
+            for step in -1isize..=1 {
+                let index = (12 - step) as usize * 50 + (25 + step) as usize;
+                assert!(
+                    "=+*#%@".contains(renderer.cells[index].ch),
+                    "{surface:?} step {step}: {}",
+                    renderer.cells[index].ch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_cell_strokes_keep_diagonal_horizontal_and_vertical_glyphs() {
+        let cases = [
+            ([false, true, true, false], (1isize, -1isize), '/'),
+            ([true, false, false, true], (1, 1), '\\'),
+            ([true, true, false, false], (1, 0), '-'),
+            ([true, false, true, false], (0, 1), '|'),
+        ];
+        for surface in [
+            SurfaceKind::Vehicle,
+            SurfaceKind::Guardrail,
+            SurfaceKind::Generic,
+            SurfaceKind::Checkpoint,
+        ] {
+            for (mask, (dx, dy), expected) in cases {
+                let mut renderer = Renderer::new(50, 25, false);
+                for offset in -1isize..=1 {
+                    put_mesh_mask(
+                        &mut renderer,
+                        (25 + offset * dx) as usize,
+                        (12 + offset * dy) as usize,
+                        surface,
+                        mask,
+                    );
+                }
+                let part = *renderer.samples[CELL_INDEX * 4..CELL_INDEX * 4 + 4]
+                    .iter()
+                    .find(|s| s.depth.is_finite())
+                    .unwrap();
+                assert_eq!(
+                    mesh_cell_role(&renderer.samples, 50, CELL_INDEX, 4, part, 0.5),
+                    CellRole::ThinStructure
+                );
+                renderer.resolve();
+                assert_eq!(
+                    renderer.cells[CELL_INDEX].ch, expected,
+                    "{surface:?} {mask:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_neighbor_coverage_does_not_make_a_stroke_look_filled() {
+        let mut renderer = Renderer::new(50, 25, false);
+        let mask = [false, true, true, false];
+        put_mesh_mask(&mut renderer, 25, 12, SurfaceKind::Generic, mask);
+        put_mesh_mask(&mut renderer, 26, 12, SurfaceKind::Generic, mask);
+        let part = renderer.samples[CELL_INDEX * 4 + 1];
+        assert_eq!(
+            mesh_cell_role(&renderer.samples, 50, CELL_INDEX, 4, part, 0.5),
+            CellRole::SilhouetteBoundary
+        );
+        renderer.samples[(CELL_INDEX + 1) * 4] = Sample {
+            depth: 2.0,
+            color: (0, 0, 0),
+            brightness: 0.5,
+            coverage: 1.0,
+            surface: SurfaceKind::Vehicle,
+        };
+        assert_eq!(
+            mesh_cell_role(&renderer.samples, 50, CELL_INDEX, 4, part, 0.5),
+            CellRole::ThinStructure
+        );
+    }
+
+    #[test]
     fn subcell_marking_survives_without_center_coverage() {
         let mut renderer = Renderer::new(50, 25, false);
         paint_strip(&mut renderer, Vec2::new(25.38, 12.5), 90.0, 0.02, 5.0);
@@ -1161,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn lighting_modulates_rgb_as_well_as_ascii() {
+    fn lighting_modulates_rgb_for_opaque_geometry() {
         let mut renderer = Renderer::new(50, 25, true);
         let tri = [
             Vertex {
@@ -1183,6 +1690,49 @@ mod tests {
         let lit = renderer.cells[12 * 50 + 25];
         assert!(dim.color.0 < lit.color.0 && lit.color.0 <= 200);
         assert!(dim.color.1 < lit.color.1 && dim.color.2 < lit.color.2);
+    }
+
+    #[test]
+    fn distant_opaque_faces_keep_ink_and_dim_in_rgb() {
+        let mut renderer = Renderer::new(50, 25, true);
+        for surface in [SurfaceKind::Generic, SurfaceKind::Road] {
+            let mut observed = Vec::new();
+            for depth in [5.0, 140.0] {
+                renderer.clear();
+                let corners = [
+                    Vec2::new(25.0, 12.0),
+                    Vec2::new(25.0, 13.0),
+                    Vec2::new(26.0, 13.0),
+                    Vec2::new(26.0, 12.0),
+                ]
+                .map(|p| screen_vertex(p, depth));
+                renderer.rasterize(
+                    [corners[0], corners[1], corners[2]],
+                    0.7,
+                    (180, 160, 130),
+                    surface,
+                );
+                renderer.rasterize(
+                    [corners[0], corners[2], corners[3]],
+                    0.7,
+                    (180, 160, 130),
+                    surface,
+                );
+                renderer.resolve();
+                observed.push(renderer.cells[CELL_INDEX]);
+            }
+            assert_eq!(observed[0].ch, observed[1].ch, "{surface:?}");
+            assert!(if surface == SurfaceKind::Road {
+                observed[1].ch == ':'
+            } else {
+                "=+*#%@".contains(observed[1].ch)
+            });
+            assert!(
+                (observed[1].color.0 as u16) * 4 < (observed[0].color.0 as u16) * 3,
+                "{surface:?}"
+            );
+            assert!(observed[1].color.0 > 0);
+        }
     }
 
     #[test]
@@ -1497,7 +2047,7 @@ mod tests {
     #[test]
     fn foreshortened_paint_fades_with_distance() {
         let mut renderer = Renderer::new(50, 25, true);
-        let mut glyph_levels = Vec::new();
+        let mut red_levels = Vec::new();
         let mut coverages = Vec::new();
         let mut effective_coverages = Vec::new();
         for depth in [5.0_f32, 15.0, 40.0, 90.0, 165.0] {
@@ -1513,20 +2063,16 @@ mod tests {
                     .unwrap()
                     .effective_coverage,
             );
-            glyph_levels.push(
-                PALETTE
-                    .iter()
-                    .position(|&ch| ch as char == renderer.cells[CELL_INDEX].ch)
-                    .unwrap(),
-            );
+            assert_ne!(renderer.cells[CELL_INDEX].ch, ' ');
+            red_levels.push(renderer.cells[CELL_INDEX].color.0);
         }
         assert!(
             coverages.windows(2).all(|pair| pair[0] > pair[1]),
             "{coverages:?}"
         );
         assert!(
-            glyph_levels.windows(2).all(|pair| pair[0] >= pair[1]),
-            "{glyph_levels:?}"
+            red_levels.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{red_levels:?}"
         );
         assert!(
             effective_coverages.windows(2).all(|pair| pair[0] > pair[1]),
@@ -1538,8 +2084,8 @@ mod tests {
                 && effective_coverages[4] < 0.001
         );
         assert!(
-            glyph_levels[0] > glyph_levels[2] && glyph_levels[4] == 0,
-            "{glyph_levels:?}"
+            red_levels[0] > red_levels[2] && red_levels[4] < 20,
+            "{red_levels:?}"
         );
     }
     #[test]
@@ -1597,5 +2143,117 @@ mod tests {
                 && contrasts[4] > contrasts[5],
             "{contrasts:?}"
         );
+    }
+    #[test]
+    fn resolved_ribbons_follow_direction_without_losing_faint_support() {
+        let mut renderer = Renderer::new(50, 25, true);
+        for (degrees, expected) in [(90.0, '|'), (0.0, '-'), (-45.0, '/'), (45.0, '\\')] {
+            renderer.clear();
+            paint_strip(&mut renderer, Vec2::new(25.5, 12.5), degrees, 0.08, 5.0);
+            renderer.resolve();
+            assert_eq!(renderer.cells[CELL_INDEX].ch, expected, "{degrees}°");
+            assert!(
+                renderer
+                    .road_marking_cell(25, 12)
+                    .unwrap()
+                    .effective_coverage
+                    > 0.0
+            );
+        }
+        renderer.clear();
+        paint_strip(&mut renderer, Vec2::new(25.5, 12.5), -45.0, 0.015, 50.0);
+        renderer.resolve();
+        let paint = renderer.road_marking_cell(25, 12).unwrap();
+        assert!(paint.effective_coverage > paint.true_coverage);
+        assert_eq!(renderer.cells[CELL_INDEX].ch, '/');
+        renderer.clear();
+        renderer.resolve();
+        assert_eq!(renderer.cells[CELL_INDEX].ch, ' ');
+    }
+
+    #[test]
+    fn occluded_ribbon_does_not_steer_glyph_or_history() {
+        let mut renderer = Renderer::new(50, 25, true);
+        paint_strip(&mut renderer, Vec2::new(25.5, 12.5), -45.0, 0.08, 5.0);
+        renderer.resolve();
+        assert_eq!(renderer.cells[CELL_INDEX].ch, '/');
+        renderer.clear();
+        paint_strip(&mut renderer, Vec2::new(25.5, 12.5), -45.0, 0.08, 5.0);
+        for sample in &mut renderer.samples[CELL_INDEX * 4..CELL_INDEX * 4 + 4] {
+            *sample = Sample {
+                depth: 3.0,
+                color: (255, 0, 0),
+                brightness: 0.8,
+                surface: SurfaceKind::Vehicle,
+                coverage: 1.0,
+            };
+        }
+        renderer.resolve();
+        assert_eq!(
+            renderer
+                .road_marking_cell(25, 12)
+                .unwrap()
+                .effective_coverage,
+            0.0
+        );
+        assert_ne!(renderer.cells[CELL_INDEX].ch, '/');
+        assert_eq!(
+            renderer.glyph_history[CELL_INDEX].surface,
+            SurfaceKind::Vehicle
+        );
+        renderer.clear();
+        paint_strip(&mut renderer, Vec2::new(25.5, 12.5), 90.0, 0.08, 5.0);
+        renderer.resolve();
+        assert_eq!(renderer.cells[CELL_INDEX].ch, '|');
+    }
+
+    #[test]
+    fn lighting_uses_rgb_without_rewriting_stable_silhouette() {
+        let mut renderer = Renderer::new(50, 25, true);
+        let shape = [
+            screen_vertex(Vec2::new(25.0, 12.0), 5.0),
+            screen_vertex(Vec2::new(25.0, 13.0), 5.0),
+            screen_vertex(Vec2::new(25.49, 12.0), 5.0),
+        ];
+        let mut seen = Vec::new();
+        for brightness in [0.65, 0.7, 0.75] {
+            renderer.clear();
+            renderer.rasterize(shape, brightness, (235, 170, 120), SurfaceKind::Vehicle);
+            renderer.resolve();
+            seen.push(renderer.cells[CELL_INDEX]);
+        }
+        assert!(seen.iter().all(|cell| "=+*#%@".contains(cell.ch)));
+        assert!(seen.iter().all(|cell| cell.ch == seen[0].ch));
+        assert!(
+            seen.windows(2)
+                .all(|pair| pair[0].color.0 < pair[1].color.0)
+        );
+    }
+
+    #[test]
+    fn resize_and_camera_jump_drop_previous_glyph() {
+        let mut renderer = Renderer::new(50, 25, true);
+        renderer.glyph_history[CELL_INDEX] = GlyphHistory {
+            ch: '/',
+            depth: 5.0,
+            color: (120, 100, 80),
+            brightness: 0.5,
+            coverage: 0.2,
+            surface: SurfaceKind::RoadMarking,
+        };
+        renderer.resize(50, 25);
+        assert_eq!(renderer.glyph_history[CELL_INDEX].ch, ' ');
+        renderer.glyph_history[CELL_INDEX].ch = '/';
+        let camera = Camera {
+            position: Vec3::ZERO,
+            target: Vec3::Z,
+        };
+        renderer.observe_camera(camera);
+        renderer.clear();
+        renderer.observe_camera(Camera {
+            position: Vec3::new(8.0, 0.0, 0.0),
+            ..camera
+        });
+        assert_eq!(renderer.glyph_history[CELL_INDEX].ch, ' ');
     }
 }

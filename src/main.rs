@@ -4,7 +4,7 @@
 use ascii_racer::{
     car::Car,
     mesh::Mesh,
-    renderer::{AaMode, Camera, DebugView, Renderer},
+    renderer::{AaMode, Camera, DebugView, GlyphMode, Renderer},
     track::{ROAD_HALF_WIDTH, Track},
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,11 +102,12 @@ impl Inputs {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn rendering_options() -> io::Result<(bool, f32, AaMode, DebugView)> {
+fn rendering_options() -> io::Result<(bool, f32, AaMode, DebugView, GlyphMode)> {
     let mut cube = false;
     let mut aspect = 0.5;
     let mut aa = AaMode::X2;
     let mut debug = DebugView::Normal;
+    let mut glyph_mode = GlyphMode::Shape;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -145,6 +146,18 @@ fn rendering_options() -> io::Result<(bool, f32, AaMode, DebugView)> {
                     }
                 };
             }
+            "--glyph-mode" => {
+                glyph_mode = match args.next().as_deref() {
+                    Some("shape") => GlyphMode::Shape,
+                    Some("density") => GlyphMode::Density,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--glyph-mode must be shape or density",
+                        ));
+                    }
+                };
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -153,12 +166,12 @@ fn rendering_options() -> io::Result<(bool, f32, AaMode, DebugView)> {
             }
         }
     }
-    Ok((cube, aspect, aa, debug))
+    Ok((cube, aspect, aa, debug, glyph_mode))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> io::Result<()> {
-    let (cube_demo, cell_aspect, aa, debug) = rendering_options()?;
+    let (cube_demo, cell_aspect, aa, debug, glyph_mode) = rendering_options()?;
     // The guard is dropped during normal return and panic unwinding.
     let _terminal = Terminal::enter()?;
     let (w, h) = terminal::size()?;
@@ -170,6 +183,7 @@ fn main() -> io::Result<()> {
         aa,
     );
     renderer.set_debug_view(debug);
+    renderer.set_glyph_mode(glyph_mode);
     let mut inputs = Inputs::default();
     let mut car = Car::new();
     let mut track = Track::new();
@@ -215,6 +229,7 @@ fn main() -> io::Result<()> {
             if inputs.reset {
                 car.reset();
                 track.reset_progress();
+                renderer.reset_glyph_history();
                 inputs.reset = false;
             }
             let offroad = track.road_distance(car.position) > ROAD_HALF_WIDTH;

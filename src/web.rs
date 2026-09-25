@@ -5,7 +5,7 @@
 
 use crate::{
     car::Car,
-    renderer::{Camera, Renderer},
+    renderer::{Camera, GlyphMode, Renderer},
     track::{ROAD_HALF_WIDTH, Track},
 };
 use glam::Vec3;
@@ -114,6 +114,7 @@ impl WebGame {
         self.car.reset();
         self.track.reset_progress();
         self.elapsed = 0.0;
+        self.renderer.reset_glyph_history();
     }
 }
 
@@ -138,6 +139,19 @@ pub extern "C" fn game_set_input(input: u32) {
     GAME.with_borrow_mut(|game| {
         if let Some(game) = game {
             game.input = input;
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn game_set_glyph_mode(mode: u32) {
+    GAME.with_borrow_mut(|game| {
+        if let Some(game) = game {
+            game.renderer.set_glyph_mode(if mode == 1 {
+                GlyphMode::Density
+            } else {
+                GlyphMode::Shape
+            });
         }
     });
 }
