@@ -353,6 +353,7 @@ fn shape_cell(
     resolved: (Sample, f32, CellRole),
     shaded: (f32, (u8, u8, u8)),
     road_blend: bool,
+    continuous_horizontal: bool,
 ) -> Cell {
     let (sample, coverage, role) = resolved;
     let (intensity, mut color) = shaded;
@@ -428,6 +429,9 @@ fn shape_cell(
             },
             center_y: if paint { marking.center.y } else { 0.5 },
             role,
+            continuous_horizontal: continuous_horizontal
+                && matches!(role, CellRole::ThinStructure)
+                && ((shape[0] + shape[1]) - (shape[2] + shape[3])).abs() > 0.5,
         },
         previous,
     );
@@ -437,6 +441,52 @@ fn shape_cell(
         depth: sample.depth,
         color,
     }
+}
+
+fn horizontal_neighbor(
+    samples: &[Sample],
+    count: usize,
+    width: usize,
+    index: usize,
+    sample: Sample,
+) -> bool {
+    // Only a three-cell run of the same visible half-cell stroke is continuous.
+    // Checking the same row of MSAA samples avoids treating a nearby filled or
+    // occluded surface as an extension of the line.
+    if count != 4 {
+        return false;
+    }
+    let x = index % width;
+    let matching_cell = |neighbor_x, band| {
+        let start = ((index / width) * width + neighbor_x) * count;
+        let cell = &samples[start..start + count];
+        let nearest = cell
+            .iter()
+            .fold(f32::INFINITY, |depth, s| depth.min(s.depth));
+        cell[band..band + 2].iter().all(|neighbor| {
+            neighbor.surface == sample.surface
+                && neighbor.color == sample.color
+                && neighbor.depth.is_finite()
+                && neighbor.depth <= nearest * 1.08
+                && neighbor.depth <= sample.depth * 1.08
+                && sample.depth <= neighbor.depth * 1.08
+                && neighbor.coverage > 0.5
+        })
+    };
+    for band in [0, 2] {
+        if !matching_cell(x, band) {
+            continue;
+        }
+        let left = x > 0 && matching_cell(x - 1, band);
+        let right = x + 1 < width && matching_cell(x + 1, band);
+        if (left && right)
+            || (left && x > 1 && matching_cell(x - 2, band))
+            || (right && x + 2 < width && matching_cell(x + 2, band))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -969,6 +1019,7 @@ impl Renderer {
 
     fn resolve(&mut self) {
         let count = self.aa.count();
+        let width = self.width;
         let all_samples = &self.samples;
         for (index, (((cell, samples), marking), history)) in self
             .cells
@@ -1144,6 +1195,7 @@ impl Renderer {
                     (paint, effective, CellRole::Filled),
                     (intensity, color),
                     true,
+                    false,
                 );
             } else if let Some((sample, coverage)) = winner {
                 let (intensity, color) = shade(sample, coverage);
@@ -1164,6 +1216,8 @@ impl Renderer {
                     (sample, coverage, role),
                     (intensity, color),
                     false,
+                    role == CellRole::ThinStructure
+                        && horizontal_neighbor(all_samples, count, width, index, sample),
                 );
             } else {
                 *history = GlyphHistory::default();
@@ -1528,11 +1582,11 @@ mod tests {
     }
 
     #[test]
-    fn one_cell_strokes_keep_diagonal_horizontal_and_vertical_glyphs() {
+    fn thin_strokes_keep_diagonal_and_vertical_direction() {
         let cases = [
             ([false, true, true, false], (1isize, -1isize), '/'),
             ([true, false, false, true], (1, 1), '\\'),
-            ([true, true, false, false], (1, 0), '-'),
+            ([true, true, false, false], (1, 0), '='),
             ([true, false, true, false], (0, 1), '|'),
         ];
         for surface in [
@@ -1565,6 +1619,31 @@ mod tests {
                     renderer.cells[CELL_INDEX].ch, expected,
                     "{surface:?} {mask:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_horizontal_stroke_uses_equals_but_short_hint_keeps_dash() {
+        for (length, expected) in [(2, false), (5, true)] {
+            let mut renderer = Renderer::new(50, 25, false);
+            for x in 25..25 + length {
+                put_mesh_mask(
+                    &mut renderer,
+                    x,
+                    12,
+                    SurfaceKind::Generic,
+                    [true, true, false, false],
+                );
+            }
+            renderer.resolve();
+            for x in 25..25 + length {
+                let glyph = renderer.cells[12 * 50 + x].ch;
+                if expected {
+                    assert_eq!(glyph, '=', "continuous stroke at {x}");
+                } else {
+                    assert!(matches!(glyph, '-' | '_'), "short hint at {x}: {glyph}");
+                }
             }
         }
     }

@@ -64,6 +64,7 @@ const CALM_OPAQUE: &[u8] = &[3];
 const MARKING: &[u8] = &[1, 2, 11, 12, 13, 14, 15, 5, 6, 7, 8];
 const FILLED: &[u8] = &[5, 6, 7, 8, 9, 10];
 const THIN: &[u8] = &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const CONTINUOUS_HORIZONTAL: &[u8] = &[5];
 
 struct GlyphTuning {
     shape_weight: f32,
@@ -105,6 +106,7 @@ pub(crate) struct GlyphInput {
     pub direction: Vec2,
     pub center_y: f32,
     pub role: CellRole,
+    pub continuous_horizontal: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +117,12 @@ pub(crate) enum CellRole {
 }
 
 fn candidates(input: GlyphInput, role: CellRole) -> &'static [u8] {
+    if input.continuous_horizontal
+        && role == CellRole::ThinStructure
+        && input.surface != SurfaceKind::RoadMarking
+    {
+        return CONTINUOUS_HORIZONTAL;
+    }
     match input.surface {
         SurfaceKind::Road | SurfaceKind::Ground => {
             if input.coverage < TUNING.calm_coverage {
@@ -292,6 +300,7 @@ mod tests {
             direction,
             center_y: 0.5,
             role: CellRole::Filled,
+            continuous_horizontal: false,
         }
     }
     #[test]
@@ -323,6 +332,7 @@ mod tests {
             direction: H,
             center_y: 0.5,
             role: CellRole::Filled,
+            continuous_horizontal: false,
         };
         assert_eq!(choose(road, None), ':');
     }
@@ -344,6 +354,7 @@ mod tests {
             direction: Vec2::ZERO,
             center_y: 0.5,
             role,
+            continuous_horizontal: false,
         }
     }
 
