@@ -190,13 +190,17 @@
       const y = (event.clientY - rect.top - rect.height / 2) / (rect.height / 2);
       const distance = Math.min(1, Math.hypot(x, y));
       const knob = joystick.querySelector('.joystick-knob');
-      knob.style.transform = `translate(${x / Math.max(1, Math.hypot(x, y)) * distance * 70}%, ${y / Math.max(1, Math.hypot(x, y)) * distance * 70}%)`;
-      setKey('left', x < -.22); setKey('right', x > .22);
-      setKey('up', y < -.22); setKey('down', y > .22);
+      knob.style.transform = `translate(${x / Math.max(1, Math.hypot(x, y)) * distance * 70}%, ${y / Math.max(1, Math.hypot(x, y)) * distance * 70}%) rotate(${x * 8}deg)`;
+      const horizontal = Math.max(-1, Math.min(1, x));
+      const deadZone = 0.12;
+      const steerMagnitude = Math.max(0, (Math.abs(horizontal) - deadZone) / (1 - deadZone));
+      wasm?.game_set_joystick_steer(Math.sign(horizontal) * steerMagnitude);
+      setKey('up', y < -.3); setKey('down', y > .3);
     }
 
     function releaseJoystick() {
       document.querySelector('.joystick-knob').style.transform = '';
+      wasm?.game_set_joystick_steer(0);
       ['up', 'down', 'left', 'right'].forEach(key => setKey(key, false));
     }
 
@@ -208,7 +212,7 @@
       const ringSize = 40;
       const ringCenter = (ringSize - 1) / 2;
       const outerRadius = 18.7;
-      const innerRadius = 17.4;
+      const innerRadius = 17.5;
       const svgNamespace = 'http://www.w3.org/2000/svg';
       for (let y = 0; y < ringSize; y++) {
         for (let x = 0; x < ringSize; x++) {
@@ -238,7 +242,7 @@
       const key = codeToKey[event.code];
       if (key) { setKey(key, false); event.preventDefault(); }
     });
-    addEventListener('blur', () => { heldInput = 0; applyInput(); });
+    addEventListener('blur', () => { heldInput = 0; wasm?.game_set_joystick_steer(0); applyInput(); });
     document.querySelectorAll('[data-key]').forEach(button => {
       const key = button.dataset.key;
       button.addEventListener('pointerdown', event => {

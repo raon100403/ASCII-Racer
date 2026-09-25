@@ -28,6 +28,7 @@ struct WebGame {
     track: Track,
     camera: ChaseCamera,
     input: u32,
+    joystick_steer: f32,
     elapsed: f32,
     packed_cells: Vec<u32>,
 }
@@ -42,6 +43,7 @@ impl WebGame {
             track: Track::new(),
             camera,
             input: 0,
+            joystick_steer: 0.0,
             elapsed: 0.0,
             packed_cells: Vec::with_capacity(width * height),
         }
@@ -52,7 +54,12 @@ impl WebGame {
         self.elapsed += dt;
         let pressed = |flag| (self.input & flag) != 0;
         let throttle = pressed(FORWARD) as i32 as f32 - pressed(BACK) as i32 as f32;
-        let steer = pressed(RIGHT) as i32 as f32 - pressed(LEFT) as i32 as f32;
+        let digital_steer = pressed(RIGHT) as i32 as f32 - pressed(LEFT) as i32 as f32;
+        let steer = if digital_steer == 0.0 {
+            self.joystick_steer
+        } else {
+            digital_steer
+        };
         let offroad = self.track.road_distance(self.car.position) > ROAD_HALF_WIDTH;
         self.car
             .update(dt, throttle, steer, pressed(HANDBRAKE), offroad);
@@ -135,6 +142,19 @@ pub extern "C" fn game_set_input(input: u32) {
     GAME.with_borrow_mut(|game| {
         if let Some(game) = game {
             game.input = input;
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn game_set_joystick_steer(steer: f32) {
+    GAME.with_borrow_mut(|game| {
+        if let Some(game) = game {
+            game.joystick_steer = if steer.is_finite() {
+                steer.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
         }
     });
 }
